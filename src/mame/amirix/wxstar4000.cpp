@@ -502,7 +502,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	NVRAM(config, "eeprom", nvram_device::DEFAULT_ALL_0);
 
 	ICM7170(config, m_rtc, XTAL(32'768));
-	// Fix: Use the correct callback name based on icm7170.cpp: out_irq_cb()
+	// Fix: Use the correct callback name based on icm7170.h: out_irq_cb()
+	// This matches the error message and the header file structure.
 	m_rtc->out_irq_cb().set(FUNC(wxstar4k_state::rtc_irq_w));
 
 	/* Graphics board hardware */

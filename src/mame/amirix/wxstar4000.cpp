@@ -503,7 +503,7 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 
 	ICM7170(config, m_rtc, XTAL(32'768));
 	// Fix: CORRECTED callback name based on icm7170.h: out_irq_cb()
-	m_rtc->out_irq_cb().set(FUNC(wxstar4k_state::rtc_irq_w)); // <-- THIS LINE IS NOW CORRECTED
+	m_rtc->irq().set(FUNC(wxstar4k_state::rtc_irq_w)); // <-- THIS LINE IS NOW CORRECTED
 	
 	/* Graphics board hardware */
 	M68010(config, m_gfxcpu, XTAL(20'000'000)/2);

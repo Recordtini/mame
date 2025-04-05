@@ -210,6 +210,16 @@ private:
 	uint8_t vidbd_sub_p3_r();
 	void vidbd_sub_p3_w(uint8_t data);
 
+	// RAMDAC access wrappers based on address decoding comments
+	uint8_t ramdac_8800_r(); // Palette Read
+	void ramdac_8800_w(uint8_t data); // Palette Write
+	uint8_t ramdac_9000_r(); // Mask Read
+	void ramdac_9000_w(uint8_t data); // Mask Write
+	uint8_t ramdac_9800_r(); // Address Read
+	void ramdac_8000_w(uint8_t data); // Address Write
+	uint8_t ramdac_a800_r(); // Overlay Read
+	void ramdac_a800_w(uint8_t data); // Overlay Write
+
 	// Interrupt handling
 	TIMER_DEVICE_CALLBACK_MEMBER(vblank_irq);
 	void rtc_irq_w(int state);
@@ -251,7 +261,6 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_rgb32 &bitm
 	// Start with a plausible guess, e.g., 640x480? 512x256?
 	// Using the configured screen size for now (512x256)
 
-	// Fix: Use const pen_t*
 	const pen_t *palette = m_palette->pens();
 	uint32_t vram_addr = 0; // Needs to be based on scroll registers / display start address if any
 
@@ -295,7 +304,6 @@ uint16_t wxstar4k_state::buserr_r()
 	LOGWARN("%s: Bus error read access!\n", machine().describe_context());
 	if (!machine().side_effects_disabled())
 	{
-		// Fix: Use set_input_line to assert BERR
 		m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
 		m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
 	}
@@ -569,8 +577,22 @@ uint8_t wxstar4k_state::vidbd_sub_fifo_r()
 	return data;
 }
 
-// Note: The RAMDAC Bt471 access needs to be routed through the device interface
-// e.g., m_ramdac->write_addr(data), m_ramdac->write_pal(data)
+// RAMDAC access wrappers using standard device read/write
+// These assume the 8051 addresses map to specific RAMDAC register offsets:
+// 8000 W -> Address Register (Offset 0) Write
+// 8800 R/W -> Palette Data Register (Offset 1) Read/Write
+// 9000 R/W -> Pixel Mask Register (Offset 2) Read/Write
+// 9800 R -> Address Register (Offset 0) Read
+// A800 R/W -> Overlay Register (Offset 3) Read/Write
+// A000, B800 - Unknown / Not directly mapped in standard Bt47x?
+uint8_t wxstar4k_state::ramdac_8800_r() { LOGGFXSUB("RAMDAC Read Palette Data (@8800)\n"); return m_ramdac->read(1); }
+void wxstar4k_state::ramdac_8800_w(uint8_t data) { LOGGFXSUB("RAMDAC Write Palette Data (@8800): %02X\n", data); m_ramdac->write(1, data); }
+uint8_t wxstar4k_state::ramdac_9000_r() { LOGGFXSUB("RAMDAC Read Mask (@9000)\n"); return m_ramdac->read(2); }
+void wxstar4k_state::ramdac_9000_w(uint8_t data) { LOGGFXSUB("RAMDAC Write Mask (@9000): %02X\n", data); m_ramdac->write(2, data); }
+uint8_t wxstar4k_state::ramdac_9800_r() { LOGGFXSUB("RAMDAC Read Address (@9800)\n"); return m_ramdac->read(0); }
+void wxstar4k_state::ramdac_8000_w(uint8_t data) { LOGGFXSUB("RAMDAC Write Address (@8000): %02X\n", data); m_ramdac->write(0, data); }
+uint8_t wxstar4k_state::ramdac_a800_r() { LOGGFXSUB("RAMDAC Read Overlay (@A800)\n"); return m_ramdac->read(3); }
+void wxstar4k_state::ramdac_a800_w(uint8_t data) { LOGGFXSUB("RAMDAC Write Overlay (@A800): %02X\n", data); m_ramdac->write(3, data); }
 
 void wxstar4k_state::vidbd_sub_map(address_map &map)
 {
@@ -590,15 +612,14 @@ void wxstar4k_state::vidbd_sub_io_map(address_map &map)
 	map(0x2000, 0x27ff).r(FUNC(wxstar4k_state::vidbd_sub_fifo_r));
 	// 2800-7FFF - undecoded? Mirrored?
 
-	// Bt471 RAMDAC access (Addresses are likely mirrored)
-	// Fix: Use public accessors: write_addr, read_pal, write_pal, read_addr, read_mask, write_mask, read_overlay, write_overlay
-	map(0x8000, 0x8000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write_addr)); // Palette Address Write
-	map(0x8800, 0x8800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read_pal), FUNC(bt471_device::write_pal)); // Palette Data R/W
-	map(0x9000, 0x9000).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read_mask), FUNC(bt471_device::write_mask)); // Pixel Mask R/W
-	map(0x9800, 0x9800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read_addr)); // Palette Address Read
-	map(0xa000, 0xa000).mirror(0x4000).nopw(); // Overlay Address Write? (No direct function, maybe implicitly sets address for A800 access?) - NOP for now
-	map(0xa800, 0xa800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read_overlay), FUNC(bt471_device::write_overlay)); // Overlay Data R/W
-	map(0xb800, 0xb800).mirror(0x4000).nopr(); // Overlay Address Read? (No direct function) - NOP for now
+	// Bt471 RAMDAC access using wrapper functions based on comments
+	map(0x8000, 0x8000).mirror(0x4000).w(FUNC(wxstar4k_state::ramdac_8000_w)); // Palette Address Write -> Offset 0
+	map(0x8800, 0x8800).mirror(0x4000).rw(FUNC(wxstar4k_state::ramdac_8800_r), FUNC(wxstar4k_state::ramdac_8800_w)); // Palette Data R/W -> Offset 1
+	map(0x9000, 0x9000).mirror(0x4000).rw(FUNC(wxstar4k_state::ramdac_9000_r), FUNC(wxstar4k_state::ramdac_9000_w)); // Pixel Mask R/W -> Offset 2
+	map(0x9800, 0x9800).mirror(0x4000).r(FUNC(wxstar4k_state::ramdac_9800_r)); // Address Read -> Offset 0
+	map(0xa000, 0xa000).mirror(0x4000).nopw(); // Overlay Address Write? (Not standard Bt47x)
+	map(0xa800, 0xa800).mirror(0x4000).rw(FUNC(wxstar4k_state::ramdac_a800_r), FUNC(wxstar4k_state::ramdac_a800_w)); // Overlay Data R/W -> Offset 3
+	map(0xb800, 0xb800).mirror(0x4000).nopr(); // Overlay Address Read? (Not standard Bt47x)
 
 	// Any remaining space up to FFFF?
 	map(0xc000, 0xffff).noprw(); // Assume unused for now
@@ -801,8 +822,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 
 	ICM7170(config, m_rtc, XTAL(32'768));
 	// Connect RTC IRQ output to Main CPU IRQ1
-	// Fix: Use correct callback name
-	m_rtc->out_int_handler().set(FUNC(wxstar4k_state::rtc_irq_w));
+	// Fix: Use correct callback name irq_cb()
+	m_rtc->irq_cb().set(FUNC(wxstar4k_state::rtc_irq_w));
 	// Other ICM7170 pins if needed (e.g., backup battery status)
 
 	/* Graphics board hardware */
@@ -820,9 +841,7 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	m_gfxsubcpu->port_out_cb<3>().set(FUNC(wxstar4k_state::vidbd_sub_p3_w)); // P3 write
 
 	BT471(config, m_ramdac, 0); // Address is placeholder, clock unknown (often 25-33 MHz range)
-	// Connect RAMDAC output to palette
-	// Fix: Remove set_palette_tag, connection is implicit
-	// Need to determine RAMDAC clock - often derived from a pixel clock crystal near it or the main GFX clock
+	// Connection to palette is implicit via screen update
 
 	/* Data/Audio board hardware */
 	I8344(config, m_datacpu, XTAL(7'372'800));  // 7.3728 MHz
@@ -857,7 +876,6 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
 	// These parameters need verification from schematics or measurement
 	// Using NTSC-like timings as a starting point, 640 width might match comments/code better
-	// Fix: Chain screen configuration calls using m_screen finder
 	m_screen->set_raw(XTAL(20'000'000) * 2 / 3, 858, 0, 640, 262, 0, 240); // Example pixel clock (~13.33MHz), total/visible scanlines/pixels
 	//screen.set_refresh_hz(59.62); // Refresh from notes (set_raw calculates this)
 	//screen.set_vblank_time(ATTOSECONDS_IN_USEC(2500)); // Placeholder vblank time (set_raw calculates this)

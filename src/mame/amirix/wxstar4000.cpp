@@ -58,6 +58,8 @@
    - Implement audio tone generation
    - Verify clock speeds and timings
    - Map unknown address areas based on code execution
+   - Verify screen parameters and VRAM mapping
+   - Verify Bt471 register mapping (pixel mask, overlay addr vs data)
 
 ***************************************************************************/
 
@@ -87,7 +89,7 @@
 #define LOG_WARN (1U << 7)
 
 //#define VERBOSE (LOG_CPU_IO | LOG_GFX_IO | LOG_GFX_SUB_IO | LOG_DATA_IO | LOG_IO_IO | LOG_IRQ | LOG_WARN)
-#define VERBOSE (LOG_WARN)
+#define VERBOSE (LOG_WARN | LOG_GFX_SUB_IO) // Enable GFX Sub IO logging for Bt471 access check
 #include "logmacro.h"
 
 #define LOGCPU(x, ...)    LOGMASKED(LOG_CPU_IO, x, ##__VA_ARGS__)
@@ -249,7 +251,8 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_rgb32 &bitm
 	// Start with a plausible guess, e.g., 640x480? 512x256?
 	// Using the configured screen size for now (512x256)
 
-	pen_t *palette = m_palette->pens();
+	// Fix: Use const pen_t*
+	const pen_t *palette = m_palette->pens();
 	uint32_t vram_addr = 0; // Needs to be based on scroll registers / display start address if any
 
 	// Let's assume the visible area maps directly from the start of VRAM for now
@@ -258,7 +261,7 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_rgb32 &bitm
 	{
 		uint32_t *scanline = &bitmap.pix(y, cliprect.left());
 		// Calculate VRAM start for this scanline based on assumed screen width
-		vram_addr = y * 512; // Adjust 512 based on actual logical screen width stored in VRAM
+		vram_addr = y * 640; // Adjust 640 based on actual logical screen width stored in VRAM (using set_raw width for now)
 		for (int x = cliprect.left(); x <= cliprect.right(); x++)
 		{
 			// Check bounds before reading VRAM
@@ -290,15 +293,13 @@ uint16_t wxstar4k_state::buserr_r()
 {
 	// Reading unmapped memory causes a bus error
 	LOGWARN("%s: Bus error read access!\n", machine().describe_context());
-	// Don't assert permanently, just trigger the exception
-	// m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
-	// m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
-	// Returning 0xffff might be read by the handler? Or just let the CPU handle it internally.
-	// If the bus error handler expects to read a value, this might be needed.
-	// For now, let the CPU exception handle it. Check schematics/code if issues arise.
 	if (!machine().side_effects_disabled())
-		m_maincpu->trigger_bus_error();
-	return 0xffff;
+	{
+		// Fix: Use set_input_line to assert BERR
+		m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
+		m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
+	}
+	return 0xffff; // Return value is often ignored by CPU during exception
 }
 
 void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask)
@@ -515,9 +516,8 @@ void wxstar4k_state::vidbd_main_map(address_map &map)
 	// --- Framebuffer VRAM ---
 	// Note: Should be 8-bit wide access for standard VRAM chips? But 68k is 16-bit bus.
 	// MAME handles this via umask or mapping as bytes/words appropriately.
-	// Let's map it as bytes using umask, assuming VRAM appears on D0-D7 or D8-D15 depending on A0/UDS/LDS.
-	// Mapping as bytes directly is simpler if access is always byte-wide. Let's try that.
-	map(0x400000, 0x5fffff).ram().share("vram"); // 2MB VRAM
+	// Mapping as bytes directly is simpler if access is always byte-wide.
+	map(0x400000, 0x5fffff).ram().share("vram"); // 2MB VRAM (mapped as bytes)
 
 	// --- VME Access Window ---
 	// E00000-E1FFFF - lower 16 address bits of VME access (to Main CPU shared RAM 0x200000-0x3fffff?)
@@ -570,7 +570,7 @@ uint8_t wxstar4k_state::vidbd_sub_fifo_r()
 }
 
 // Note: The RAMDAC Bt471 access needs to be routed through the device interface
-// e.g., m_ramdac->address_w(data), m_ramdac->palette_w(data)
+// e.g., m_ramdac->write_addr(data), m_ramdac->write_pal(data)
 
 void wxstar4k_state::vidbd_sub_map(address_map &map)
 {
@@ -591,13 +591,14 @@ void wxstar4k_state::vidbd_sub_io_map(address_map &map)
 	// 2800-7FFF - undecoded? Mirrored?
 
 	// Bt471 RAMDAC access (Addresses are likely mirrored)
-	map(0x8000, 0x8000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::address_w)); // Palette Address Write
-	map(0x8800, 0x8800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::palette_r), FUNC(bt471_device::palette_w)); // Palette Data R/W
-	map(0x9000, 0x9000).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::pixel_mask_r), FUNC(bt471_device::pixel_mask_w)); // Pixel Mask R/W
-	map(0x9800, 0x9800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::address_r)); // Palette Address Read
-	map(0xa000, 0xa000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::overlay_address_w)); // Overlay Address Write
-	map(0xa800, 0xa800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::overlay_r), FUNC(bt471_device::overlay_w)); // Overlay Data R/W
-	map(0xb800, 0xb800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::overlay_address_r)); // Overlay Address Read
+	// Fix: Use public accessors: write_addr, read_pal, write_pal, read_addr, read_mask, write_mask, read_overlay, write_overlay
+	map(0x8000, 0x8000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write_addr)); // Palette Address Write
+	map(0x8800, 0x8800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read_pal), FUNC(bt471_device::write_pal)); // Palette Data R/W
+	map(0x9000, 0x9000).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read_mask), FUNC(bt471_device::write_mask)); // Pixel Mask R/W
+	map(0x9800, 0x9800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read_addr)); // Palette Address Read
+	map(0xa000, 0xa000).mirror(0x4000).nopw(); // Overlay Address Write? (No direct function, maybe implicitly sets address for A800 access?) - NOP for now
+	map(0xa800, 0xa800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read_overlay), FUNC(bt471_device::write_overlay)); // Overlay Data R/W
+	map(0xb800, 0xb800).mirror(0x4000).nopr(); // Overlay Address Read? (No direct function) - NOP for now
 
 	// Any remaining space up to FFFF?
 	map(0xc000, 0xffff).noprw(); // Assume unused for now
@@ -702,8 +703,7 @@ void wxstar4k_state::iobd_main_map(address_map &map)
 
 void wxstar4k_state::iobd_main_io_map(address_map &map)
 {
-	// Needs internal RAM (128 bytes for 8031/8051)
-	// map(0x0000, 0x007f).ram(); // MAME maps this automatically for MCS51?
+	// Needs internal RAM (128 bytes for 8031/8051) - mapped by core
 
 	// Need to map external peripherals: i8251A UART, Keyboard controller registers
 	// Addresses unknown, need code analysis. Example:
@@ -732,10 +732,10 @@ void wxstar4k_state::machine_reset()
 	// Main RAM is 16-bit wide
 	uint16_t *ram = m_mainram.target();
 	uint16_t *rom = (uint16_t *)memregion("maincpu")->base();
-	ram[0] = rom[0]; // Initial SP
-	ram[1] = rom[1]; // Initial PC word 1
-	ram[2] = rom[2]; // Initial PC word 2? No, M68k vector is SP then PC.
-	ram[3] = rom[3]; // PC word 2
+	ram[0] = rom[0]; // Initial SP word 1
+	ram[1] = rom[1]; // Initial SP word 2
+	ram[2] = rom[2]; // Initial PC word 1
+	ram[3] = rom[3]; // Initial PC word 2
 
 	// Zero out interrupt vectors / flags
 	m_cpu_irq_vector = 0; // Default vectors might be set by ROM
@@ -765,7 +765,7 @@ TIMER_DEVICE_CALLBACK_MEMBER(wxstar4k_state::vblank_irq)
 	m_gfxcpu->set_input_line(M68K_IRQ_5, ASSERT_LINE);
 	// Auto-vector, so CPU fetches vector from 0x74 (Level 5 Auto-vector)
 	// Line should be cleared by the interrupt handler? Or automatically? Assume handler clears.
-	// For now, clear it after a short delay or let handler do it. Let's clear immediately.
+	// For now, clear it after a short delay or let handler do it. Let's clear immediately for now.
 	m_gfxcpu->set_input_line(M68K_IRQ_5, CLEAR_LINE);
 
 	// GFX Sub CPU P3.2 (INT0) = Vertical Drive Interrupt?
@@ -801,7 +801,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 
 	ICM7170(config, m_rtc, XTAL(32'768));
 	// Connect RTC IRQ output to Main CPU IRQ1
-	m_rtc->irq_out_cb().set(FUNC(wxstar4k_state::rtc_irq_w));
+	// Fix: Use correct callback name
+	m_rtc->out_int_handler().set(FUNC(wxstar4k_state::rtc_irq_w));
 	// Other ICM7170 pins if needed (e.g., backup battery status)
 
 	/* Graphics board hardware */
@@ -820,7 +821,7 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 
 	BT471(config, m_ramdac, 0); // Address is placeholder, clock unknown (often 25-33 MHz range)
 	// Connect RAMDAC output to palette
-	m_ramdac->set_palette_tag(m_palette);
+	// Fix: Remove set_palette_tag, connection is implicit
 	// Need to determine RAMDAC clock - often derived from a pixel clock crystal near it or the main GFX clock
 
 	/* Data/Audio board hardware */
@@ -855,19 +856,18 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	/* video hardware */
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
 	// These parameters need verification from schematics or measurement
-	// Using NTSC-like timings as a starting point
-	screen.set_raw(XTAL(20'000'000) * 2 / 3, 858, 0, 640, 262, 0, 240); // Example pixel clock, total/visible scanlines/pixels
-	// screen.set_refresh_hz(59.62); // Refresh from notes
-	// screen.set_vblank_time(ATTOSECONDS_IN_USEC(2500)); // Placeholder vblank time
-	// screen.set_size(640, 480); // Logical size? Framebuffer is huge.
-	// screen.set_visarea(0, 640-1, 0, 240-1); // Visible area based on comments, width guessed
-	screen.set_screen_update(FUNC(wxstar4k_state::screen_update));
-	screen.set_palette(m_palette);
+	// Using NTSC-like timings as a starting point, 640 width might match comments/code better
+	// Fix: Chain screen configuration calls using m_screen finder
+	m_screen->set_raw(XTAL(20'000'000) * 2 / 3, 858, 0, 640, 262, 0, 240); // Example pixel clock (~13.33MHz), total/visible scanlines/pixels
+	//screen.set_refresh_hz(59.62); // Refresh from notes (set_raw calculates this)
+	//screen.set_vblank_time(ATTOSECONDS_IN_USEC(2500)); // Placeholder vblank time (set_raw calculates this)
+	m_screen->set_screen_update(FUNC(wxstar4k_state::screen_update));
+	m_screen->set_palette(m_palette);
 
 	PALETTE(config, m_palette).set_entries(256);
 
 	// VBLANK Timer triggering GFX CPU IRQ 5 and GFX SUB CPU INT0
-	TIMER(config, "vblank").configure_periodic(FUNC(wxstar4k_state::vblank_irq), screen.frame_period());
+	TIMER(config, "vblank").configure_periodic(FUNC(wxstar4k_state::vblank_irq), m_screen->frame_period());
 
 	/* sound hardware */
 	// Add speaker and sound generation devices here later

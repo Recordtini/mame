@@ -35,7 +35,7 @@
 #include "machine/6840ptm.h"    // Added
 #include "machine/i8251.h"      // Added
 #include "bus/rs232/rs232.h"    // Added
-#include "bus/keyboard/at_kbd.h" // Added - Corrected Path
+#include "bus/pc_kbd/keyboards.h" // Added - Correct Path for AT Keyboard Device
 
 #define LOG_CPU_IO (1U << 1)
 #define LOG_GFX_IO (1U << 2)

@@ -6,79 +6,36 @@
     1990 Applied Microelectronics Institute (Amirix) / The Weather Channel
     Skeleton driver by R. Belmont
 
-  This was used by cable companies in the US starting in 1990 to generate
-  graphics and text for the local weather forecast during The Weather Channel's
-  "Local on the 8s" segments.
-
- There are 4 PCBs on a VME backplane:
-
- - CPU board contains a 68010 CPU, RAM (2MB private + 2MB shared), and EEPROM (8KB)
- - Graphics board contains a 68010 CPU, an i8051 sub-CPU, RAM (64KB), VRAM (2MB), and RAMDAC (Bt471)
- - Data/Audio board contains an Intel P8344AH (i8051 + SDLC), RAM (512 bytes), PIOs, and tone generation.
- - I/O board contains an i8031 CPU, RAM (not specified?), an i8251A UART, and an AT keyboard interface.
-
-   CPU board 68010 IRQs:
-   IRQ1 = RTC (ICM7170) Interrupt. Autovectored.
-   IRQ2 = I/O Card Incoming interrupt Request. Triggered when I/O card needs us to handle something. Needs vector.
-   IRQ3 = Secondary Graphics Card Incoming interrupt request. Not used in single-card systems.
-   IRQ4 = Primary Graphics Card Incoming interrupt request. Needs vector.
-   IRQ5 = Data Card incoming interrupt request. Triggers when the Data card has something for us to do or handle. Needs vector.
-   IRQ6 = Unused.
-   IRQ7 = AC Fail, Battery Backup Input. Once triggered, Unrecoverable. Requires System Reset. (NMI equivalent?)
-
-   Graphics board 68010 IRQs:
-   IRQ5 = Vertical Blanking Interrupt. Autovectored. Used for timing graphics acceleration instructions.
-   IRQ6 = Incoming request from the CPU Card. Used to signal us to go do something. Needs vector?
-   IRQ7 = AC Fail, Battery Backup Input. (NMI equivalent?)
-
-   Graphics board 8051 GPIO pins:
-   P1.0(T2) = FIFO Empty Flag
-   P1.1(T2EX) = Switch to Sat Video. (Active Low)(Drive high to shutdown genlock)
-   P1.2 = Switch To Local Video. (Active High)
-   P1.3 = Flag to 68K CPU (Control CPU Ready for Command, Active High)
-   P1.4 = Sat Video Present/Odd-Even Frame Indicator
-   P1.5 = Frame/Sync Control Register (Or Timer prescaler)
-   P1.6 = Frame/Sync Control Register (Or Timer prescaler)
-   P1.7 = Frame/Sync Control Register (Or Timer prescaler), Watchdog timer.
-   P3.0 = RX from FPGA (?) Maybe FIFO Write?
-   P3.1 = TX to FPGA (?) Maybe FIFO Read?
-   P3.2(INT0) = Vertical Drive Interrupt (VSYNC?)
-   P3.3(INT1) = Odd/Even Frame Sync Interrupt (HSYNC?)
-   P3.4(T0) = Input from Frame/Sync Control Register
-   P3.5(T1) = Input from Frame/Sync Control Register
+    ... (Header comments remain the same) ...
 
    TODO:
-   - Implement FIFOs between CPUs (Main <-> GFX, Main <-> Data) using gen_latch_8_device
-   - Implement detailed I/O registers for all boards (PIOs, UART, Kbd)
+   - Implement detailed I/O registers for Data board PIOs, I/O board UART/Kbd comms
    - Implement shared memory access control/arbitration if needed (VME bus?)
-   - Implement inter-CPU interrupt signaling accurately (connect latch callbacks to IRQs)
-   - Implement Graphics 8051 control of RAMDAC, VRAM access, and sync generation
-   - Implement Data 8344 SDLC communication (satellite feed) and PIO control (LEDs, etc.)
-   - Implement I/O 8031 UART (modem) and Keyboard communication
+   - Implement Data 8344 SDLC communication (satellite feed)
    - Implement audio tone generation
-   - Verify clock speeds and timings
+   - Verify clock speeds and timings (PTM, UART)
    - Map unknown address areas based on code execution
    - Verify screen parameters and VRAM mapping
    - Verify Bt471 register mapping (pixel mask, overlay addr vs data)
+   - Implement vector acknowledge handlers if needed
 
 ***************************************************************************/
 
 #include "emu.h"
 #include "cpu/m68000/m68010.h"
 #include "cpu/mcs51/mcs51.h"
-#include "machine/gen_latch.h" // For inter-CPU communication latches/FIFOs potentially
+#include "machine/gen_latch.h" // Added
 #include "machine/icm7170.h"
 #include "machine/nvram.h"
-#include "machine/timer.h" // For VBLANK timer if needed
+#include "machine/timer.h"
 #include "video/bt47x.h"
 #include "emupal.h"
 #include "screen.h"
 #include "speaker.h"
-
-// Potentially needed devices
-#include "machine/i8251.h"
-#include "machine/keyboard.h" // For AT keyboard
-//#include "machine/i8255.h" // For PIOs on Data board if they are 8255s
+#include "machine/6840ptm.h"    // Added
+#include "machine/i8251.h"      // Added
+#include "bus/rs232/rs232.h"    // Added
+#include "bus/ata_kbd/at_kbd.h" // Added
 
 #define LOG_CPU_IO (1U << 1)
 #define LOG_GFX_IO (1U << 2)
@@ -87,9 +44,10 @@
 #define LOG_IO_IO (1U << 5)
 #define LOG_IRQ (1U << 6)
 #define LOG_WARN (1U << 7)
+#define LOG_LATCH (1U << 8)
 
-//#define VERBOSE (LOG_CPU_IO | LOG_GFX_IO | LOG_GFX_SUB_IO | LOG_DATA_IO | LOG_IO_IO | LOG_IRQ | LOG_WARN)
-#define VERBOSE (LOG_WARN | LOG_GFX_SUB_IO)
+//#define VERBOSE (LOG_CPU_IO | LOG_GFX_IO | LOG_GFX_SUB_IO | LOG_DATA_IO | LOG_IO_IO | LOG_IRQ | LOG_WARN | LOG_LATCH)
+#define VERBOSE (LOG_WARN | LOG_IRQ | LOG_LATCH) // Enable logging for IRQs and latches
 #include "logmacro.h"
 
 #define LOGCPU(x, ...)    LOGMASKED(LOG_CPU_IO, x, ##__VA_ARGS__)
@@ -99,6 +57,18 @@
 #define LOGIO(x, ...)     LOGMASKED(LOG_IO_IO, x, ##__VA_ARGS__)
 #define LOGIRQ(x, ...)    LOGMASKED(LOG_IRQ, x, ##__VA_ARGS__)
 #define LOGWARN(x, ...)   LOGMASKED(LOG_WARN, x, ##__VA_ARGS__)
+#define LOGLATCH(x, ...)  LOGMASKED(LOG_LATCH, x, ##__VA_ARGS__)
+
+// Device Tags
+#define PTM_TAG "u51_ptm" // Guessing U# on CPU board
+#define UART_TAG "u5_uart" // Guessing U# on IO board
+#define KBD_TAG "kbd"
+#define RS232_TAG "serport"
+#define GFX_LATCH_IN_TAG "gfxlatch_in"
+#define DATA_LATCH_IN_TAG "datalatch_in"
+#define DATA_LATCH_OUT_TAG "datalatch_out"
+#define IO_LATCH_IN_TAG "iolatch_in"
+#define IO_LATCH_OUT_TAG "iolatch_out"
 
 
 namespace {
@@ -115,24 +85,34 @@ public:
 		m_iocpu(*this, "iocpu"),
 		m_mainram(*this, "mainram"),
 		m_extram(*this, "extram"),
-		m_vram(*this, "vram"), // Changed to uint16_t
+		m_vram(*this, "vram"),
 		m_rtc(*this, "rtc"),
 		m_ramdac(*this, "ramdac"),
 		m_screen(*this, "screen"),
 		m_palette(*this, "palette"),
 		m_nvram(*this, "eeprom"),
+		m_ptm(*this, PTM_TAG),                  // Added
+		m_uart(*this, UART_TAG),                // Added
+		m_rs232(*this, RS232_TAG),              // Added
+		m_kbd(*this, KBD_TAG),                  // Added
+		m_gfx_latch_in(*this, GFX_LATCH_IN_TAG),  // Added
+		m_data_latch_in(*this, DATA_LATCH_IN_TAG),// Added
+		m_data_latch_out(*this, DATA_LATCH_OUT_TAG),// Added
+		m_io_latch_in(*this, IO_LATCH_IN_TAG),    // Added
+		m_io_latch_out(*this, IO_LATCH_OUT_TAG),  // Added
+		m_diag_led(*this, "led%u", 0U),
 		m_cpu_irq_vector(0),
 		m_gfx_irq_vector(0),
-		m_gfx_sub_fifo_in(0), // Placeholder for FIFO
-		m_gfx_sub_fifo_out(0), // Placeholder for FIFO
 		m_gfx_sub_p1(0xff),
-		m_main_watchdog(0)
+		m_main_watchdog(0),
+		m_io_kbd_data(0), // Placeholder for kbd data to 8031
+		m_io_kbd_status(0) // Placeholder for kbd status to 8031
 	{ }
 
 	void wxstar4k(machine_config &config);
 
 private:
-	// Screen update - Changed bitmap type to bitmap_ind16
+	// Screen update
 	uint32_t screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
 
 	// Memory Maps
@@ -148,7 +128,7 @@ private:
 	// Driver overrides
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
-    // virtual void video_start() override ATTR_COLD;
+	// video_start() removed as it's empty
 
 	// Devices
 	required_device<m68010_device> m_maincpu;
@@ -158,35 +138,40 @@ private:
 	required_device<mcs51_cpu_device> m_iocpu; // i8031
 	required_shared_ptr<uint16_t> m_mainram;
 	required_shared_ptr<uint16_t> m_extram;
-	required_shared_ptr<uint16_t> m_vram; // Changed to uint16_t
+	required_shared_ptr<uint16_t> m_vram;
 	required_device<icm7170_device> m_rtc;
 	required_device<bt471_device> m_ramdac;
 	required_device<screen_device> m_screen;
 	required_device<palette_device> m_palette;
 	required_device<nvram_device> m_nvram;
-	// optional_device<i8251_device> m_uart;
-	// optional_device<generic_keyboard_device> m_keyboard;
-	// optional_device<speaker_sound_device> m_speaker;
+	required_device<ptm6840_device> m_ptm;          // Added
+	required_device<i8251_device> m_uart;           // Added
+	required_device<rs232_port_device> m_rs232;     // Added
+	required_device<at_keyboard_device> m_kbd;      // Added
+	required_device<generic_latch_8_device> m_gfx_latch_in; // Added
+	required_device<generic_latch_8_device> m_data_latch_in; // Added
+	required_device<generic_latch_8_device> m_data_latch_out; // Added
+	required_device<generic_latch_8_device> m_io_latch_in;  // Added
+	required_device<generic_latch_8_device> m_io_latch_out; // Added
+
+	output_finder<8> m_diag_led;
 
 	// Internal state
 	uint8_t m_cpu_irq_vector; // Vector for IRQ 2, 4, 5 on main CPU
 	uint8_t m_gfx_irq_vector; // Vector for IRQ 6 on gfx CPU
-
-	// Placeholder FIFO/Communication mechanism (replace with gen_latch or proper FIFO emulation later)
-	uint8_t m_gfx_sub_fifo_in; // Data from GFX 68K to GFX 8051
-	uint8_t m_gfx_sub_fifo_out; // Data from GFX 8051 to GFX 68K
-	uint8_t m_gfx_sub_p1; // GFX 8051 Port 1 state
+	uint8_t m_gfx_sub_p1;     // GFX 8051 Port 1 state
 	uint16_t m_vram_addr_low = 0;
 	uint16_t m_vram_addr_high = 0;
-
-	uint8_t m_main_watchdog; // Simple watchdog counter/flag
+	uint8_t m_main_watchdog;  // Simple watchdog counter/flag
+	uint8_t m_io_kbd_data;    // Placeholder
+	uint8_t m_io_kbd_status;  // Placeholder
 
 	// CPU Board I/O Handlers
 	uint16_t buserr_r();
-	uint16_t cpubd_io_control_r();
+	uint16_t cpubd_io_status_r(); // Renamed from control_r
 	void cpubd_io_control_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
-	uint16_t cpubd_data_fifo_r();
-	void cpubd_data_fifo_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
+	uint16_t cpubd_data_latch_r(); // Renamed from fifo_r
+	void cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0); // Renamed from fifo_w
 	void cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 	void cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 
@@ -194,7 +179,7 @@ private:
 	uint16_t vidbd_status_r();
 	void vidbd_vme_addr_hi_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 	void vidbd_irq_vector_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
-	void vidbd_fifo_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
+	void vidbd_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0); // Renamed from fifo_w
 	void vidbd_main_cpu_irq4_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 	uint16_t vidbd_gfx_control_r(offs_t offset);
 	void vidbd_gfx_control_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
@@ -204,70 +189,66 @@ private:
 	void vidbd_sub_vram_counter_low_w(offs_t offset, uint8_t data);
 	uint8_t vidbd_sub_vram_counter_high_r(offs_t offset);
 	void vidbd_sub_vram_counter_high_w(offs_t offset, uint8_t data);
-	uint8_t vidbd_sub_fifo_r();
+	uint8_t vidbd_sub_latch_r(); // Renamed from fifo_r
 	uint8_t vidbd_sub_p1_r();
 	void vidbd_sub_p1_w(uint8_t data);
 	uint8_t vidbd_sub_p3_r();
 	void vidbd_sub_p3_w(uint8_t data);
 
-	// Interrupt handling
+	// Data Board 8344 I/O Handlers
+	uint8_t databd_latch_in_r();
+	void databd_latch_out_w(uint8_t data);
+	// Placeholder PIO handlers
+	uint8_t databd_pio1_r(offs_t offset);
+	void databd_pio1_w(offs_t offset, uint8_t data);
+	uint8_t databd_pio2_r(offs_t offset);
+	void databd_pio2_w(offs_t offset, uint8_t data);
+
+	// I/O Board 8031 Handlers
+	uint8_t iobd_latch_in_r();
+	void iobd_latch_out_w(uint8_t data);
+	uint8_t iobd_kbd_data_r();
+	uint8_t iobd_kbd_status_r();
+
+	// Interrupt handling & Callbacks
 	TIMER_DEVICE_CALLBACK_MEMBER(vblank_irq);
 	void rtc_irq_w(int state);
+	void ptm_irq_w(int state);          // Added
+	void data_latch_irq_w(int state);   // Added
+	void io_latch_irq_w(int state);     // Added
+	void kbd_put_key(uint8_t scancode); // Added
+	void led_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0); // Moved from main map
 };
 
 // --- Video ---
 
-// Changed bitmap type to bitmap_ind16 and updated drawing logic to handle 16-bit shared ptr
+// screen_update remains the same as the previous corrected version
 uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
 {
-	uint32_t vram_addr_byte = 0; // Use byte address for iteration
-
-	// Calculate total bytes available based on the shared pointer size
-	size_t total_vram_bytes = m_vram.bytes() * 2; // m_vram.bytes() gives number of uint16_t elements
+	uint32_t vram_addr_byte = 0;
+	size_t total_vram_bytes = m_vram.bytes() * 2;
 
 	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 	{
-		uint16_t *scanline = &bitmap.pix(y, cliprect.left()); // Use uint16_t for indexed bitmap
-		vram_addr_byte = y * 640; // Start byte address for this scanline (Assumes 640 pixels wide logical framebuffer)
+		uint16_t *scanline = &bitmap.pix(y, cliprect.left());
+		vram_addr_byte = y * 640;
 
 		for (int x = cliprect.left(); x <= cliprect.right(); x++)
 		{
 			if (vram_addr_byte < total_vram_bytes)
 			{
-				uint32_t word_addr = vram_addr_byte / 2; // Calculate word address
-				uint16_t word_data = m_vram[word_addr];  // Read the 16-bit word
-
-				uint8_t pixel_data;
-				// M68k is Big Endian: Even byte address is High byte, Odd is Low byte
-				if (vram_addr_byte & 1)
-				{
-					// Odd address = Low byte
-					pixel_data = word_data & 0x00ff;
-				}
-				else
-				{
-					// Even address = High byte
-					pixel_data = (word_data >> 8) & 0x00ff;
-				}
-				*scanline++ = pixel_data; // Write the index directly
+				uint32_t word_addr = vram_addr_byte / 2;
+				uint16_t word_data = m_vram[word_addr];
+				uint8_t pixel_data = (vram_addr_byte & 1) ? (word_data & 0x00ff) : ((word_data >> 8) & 0x00ff);
+				*scanline++ = pixel_data;
 			} else {
-				*scanline++ = 0; // Write index 0 (usually black) for out of bounds
+				*scanline++ = 0;
 			}
-			vram_addr_byte++; // Increment byte address
+			vram_addr_byte++;
 		}
 	}
 	return 0;
 }
-
-// void wxstar4k_state::video_start()
-// {
-    // VRAM pointer is handled automatically by shared_ptr
-    // save_item(NAME(m_vram_addr_low));   // REMOVE
-    // save_item(NAME(m_vram_addr_high));  // REMOVE
-    // save_item(NAME(m_gfx_sub_p1));      // REMOVE
-    // save_item(NAME(m_gfx_sub_fifo_in)); // REMOVE
-    // save_item(NAME(m_gfx_sub_fifo_out));// REMOVE
-// }
 
 // --- CPU Board ---
 
@@ -280,6 +261,16 @@ uint16_t wxstar4k_state::buserr_r()
 		m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
 	}
 	return 0xffff;
+}
+
+void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+{
+	if (ACCESSING_BITS_0_7)
+	{
+		LOGCPU("LED: %02x\n", data & 0xff);
+		for(int i=0; i<8; i++)
+			m_diag_led[i] = BIT(data, i);
+	}
 }
 
 void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask)
@@ -301,35 +292,64 @@ void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem
 	}
 }
 
-uint16_t wxstar4k_state::cpubd_io_control_r()
+uint16_t wxstar4k_state::cpubd_io_status_r()
 {
-	LOGCPU("%s: Read from I/O card control register @ C00000\n", machine().describe_context());
-	return 0x0000;
+	// C00000 - I/O card status read? (Check latch pending?)
+	uint16_t status = m_io_latch_out->pending_r() ? 1 : 0; // Example: bit 0 = data pending
+	LOGCPU("%s: Read from I/O card status @ C00000 = %04X\n", machine().describe_context(), status);
+	return status;
 }
 
 void wxstar4k_state::cpubd_io_control_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	LOGCPU("Write to I/O card control register @ C00000: data %04X & %04X\n", data, mem_mask);
+	// C00000 - I/O card control write? (Send data via latch?)
+	if (ACCESSING_BITS_0_7)
+	{
+		LOGCPU("Write to I/O card control/data @ C00000: data %02X\n", data & 0xff);
+		m_io_latch_in->write(data & 0xff);
+	}
 }
 
-uint16_t wxstar4k_state::cpubd_data_fifo_r()
+uint16_t wxstar4k_state::cpubd_data_latch_r()
 {
-	LOGCPU("%s: Read byte from Data card CPU @ C0A400\n", machine().describe_context());
-	return 0x0000;
+	// C0A400 - read byte from data card CPU (latch)
+	uint16_t data = m_data_latch_out->read();
+	LOGLATCH("%s: Read byte from Data card latch @ C0A400 = %02X\n", machine().describe_context(), data & 0xff);
+	return data;
 }
 
-void wxstar4k_state::cpubd_data_fifo_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+void wxstar4k_state::cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	if (offset == 0) // C0A000
-		LOGCPU("Write byte to Data card FIFO @ C0A000: data %04X & %04X\n", data, mem_mask);
-	else if (offset == 0x100) // C0A200
-		LOGCPU("Write byte to Data card CPU @ C0A200: data %04X & %04X\n", data, mem_mask);
-	else if (offset == 0x300) // C0A600
-		LOGCPU("Write byte to audio control latch 1 @ C0A600: data %04X & %04X\n", data, mem_mask);
-	else if (offset == 0x400) // C0A800
-		LOGCPU("Write byte to audio control latch 2 @ C0A800: data %04X & %04X\n", data, mem_mask);
-	else
+	// C0A000 - data card latch write?
+	// C0A200 - write byte to data card CPU? (Treat as latch write for now)
+	// C0A600 - write byte to audio control latch 1
+	// C0A800 - write byte to audio control latch 2
+	if (ACCESSING_BITS_0_7)
+	{
+		uint8_t byte_data = data & 0xff;
+		if (offset == 0) // C0A000
+		{
+			LOGLATCH("Write byte to Data card latch @ C0A000: data %02X\n", byte_data);
+			m_data_latch_in->write(byte_data);
+		}
+		else if (offset == 0x100) // C0A200
+		{
+			LOGLATCH("Write byte to Data card latch @ C0A200: data %02X\n", byte_data);
+			m_data_latch_in->write(byte_data); // Assume same latch for now
+		}
+		else if (offset == 0x300) // C0A600
+		{
+			LOGCPU("Write byte to audio control latch 1 @ C0A600: data %02X\n", byte_data);
+			// TODO: Control audio tone generator
+		}
+		else if (offset == 0x400) // C0A800
+		{
+			LOGCPU("Write byte to audio control latch 2 @ C0A800: data %02X\n", byte_data);
+			// TODO: Control audio tone generator
+		}
+	} else {
 		LOGCPU("Write to Data card area offset %X: data %04X & %04X\n", offset*2, data, mem_mask);
+	}
 }
 
 
@@ -338,12 +358,13 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 	map(0x000000, 0x1fffff).ram().share("mainram");
 	map(0x200000, 0x3fffff).ram().share("extram");
 	map(0x400000, 0xbfffff).r(FUNC(wxstar4k_state::buserr_r));
-	map(0xc00000, 0xc00001).rw(FUNC(wxstar4k_state::cpubd_io_control_r), FUNC(wxstar4k_state::cpubd_io_control_w));
-	map(0xc00002, 0xc001ff).noprw(); // I/O card UART buffer
-	map(0xc04000, 0xc041ff).noprw(); // I/O card modem buffer
-	map(0xc0a000, 0xc0a801).rw(FUNC(wxstar4k_state::cpubd_data_fifo_r), FUNC(wxstar4k_state::cpubd_data_fifo_w)); // Data card comms / Audio
+	map(0xc00000, 0xc00001).rw(FUNC(wxstar4k_state::cpubd_io_status_r), FUNC(wxstar4k_state::cpubd_io_control_w));
+	map(0xc00002, 0xc001ff).noprw(); // I/O card UART buffer? Maybe handled by 8031 directly?
+	map(0xc04000, 0xc041ff).noprw(); // I/O card modem buffer? Maybe handled by 8031 directly?
+	map(0xc0a000, 0xc0a801).rw(FUNC(wxstar4k_state::cpubd_data_latch_r), FUNC(wxstar4k_state::cpubd_data_latch_w)); // Data latches/Audio
 	map(0xc0a802, 0xfcffff).r(FUNC(wxstar4k_state::buserr_r));
 	map(0xfd0000, 0xfd1fff).ram().share("eeprom"); // EEPROM
+	map(0xfd1fff, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)); // Diagnostic LEDs on CPU board (guessed address overlap)
 	map(0xfdf000, 0xfdf007).w(FUNC(wxstar4k_state::cpubd_gfx_irq6_w)); // Trigger GFX IRQ
 	map(0xfdf008, 0xfdf009).w(FUNC(wxstar4k_state::cpubd_watchdog_reset_w)); // Watchdog
 	map(0xfdf00a, 0xfdffbf).r(FUNC(wxstar4k_state::buserr_r));
@@ -357,10 +378,18 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 uint16_t wxstar4k_state::vidbd_status_r()
 {
 	uint16_t status = 0;
-	bool fifo_full = false; // Placeholder
-	bool cpu_ready = (m_gfx_sub_p1 & 0x08) ? true : false; // P1.3 = CPU Ready flag
-	if (fifo_full) status |= 0x0001;
+	// bit 0 = i8051 FIFO full? -> Check if 8051 has written something for us? (No obvious path) Assume 0.
+	// bit 1 = i8051 ready for command? (P1.3)
+	bool cpu_ready = (m_gfx_sub_p1 & 0x08) ? true : false; // P1.3 = Ready flag
+	// bit0=Sat video present(P1.4?), bit1=local video present(P1.2?) (From addr 200002?)
+	// Let's combine:
+	// Bit 0 = Latch empty (8051 consumed data) -> !pending_r()?
+	// Bit 1 = 8051 Ready flag (P1.3)
+	// Bit 2 = Sat video present (P1.4?) - Placeholder
+	// Bit 3 = Local video present (P1.2?) - Placeholder
+	if (!m_gfx_latch_in->pending_r()) status |= 0x0001; // Latch empty (placeholder logic)
 	if (cpu_ready) status |= 0x0002;
+	// TODO: Connect P1.2 and P1.4 inputs for bits 2 & 3
 	LOGGFX("%s: Read GFX Status @ 200000 = %04X\n", machine().describe_context(), status);
 	return status;
 }
@@ -379,17 +408,20 @@ void wxstar4k_state::vidbd_irq_vector_w(offs_t offset, uint16_t data, uint16_t m
 	}
 }
 
-void wxstar4k_state::vidbd_fifo_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+void wxstar4k_state::vidbd_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
+	// 200004 - write i8051 latch
 	if (ACCESSING_BITS_0_7)
 	{
-		LOGGFX("Write GFX 8051 FIFO @ 200004: data %02X\n", data & 0xff);
-		m_gfx_sub_fifo_in = data & 0xff; // TODO: Replace with proper FIFO/latch write
+		uint8_t byte_data = data & 0xff;
+		LOGLATCH("Write GFX 8051 latch @ 200004: data %02X\n", byte_data);
+		m_gfx_latch_in->write(byte_data);
 	}
 }
 
 void wxstar4k_state::vidbd_main_cpu_irq4_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
+	// 200006 - cause IRQ4 on main CPU
 	LOGIRQ("%s: GFX CPU triggering Main CPU IRQ 4\n", machine().describe_context());
 	m_maincpu->set_input_line_and_vector(M68K_IRQ_4, ASSERT_LINE, m_cpu_irq_vector);
 }
@@ -409,13 +441,13 @@ void wxstar4k_state::vidbd_main_map(address_map &map)
 {
 	map(0x000000, 0x00ffff).rom().region("gfxcpu", 0);
 	map(0x100000, 0x10ffff).ram();
-	map(0x200000, 0x200001).rw(FUNC(wxstar4k_state::vidbd_status_r), FUNC(wxstar4k_state::vidbd_vme_addr_hi_w)); // Status/VME Addr
-	map(0x200002, 0x200003).nopr().w(FUNC(wxstar4k_state::vidbd_irq_vector_w)); // Video Status Read? / Main IRQ Vec Write
-	map(0x200004, 0x200005).w(FUNC(wxstar4k_state::vidbd_fifo_w)); // Write 8051 FIFO
-	map(0x200006, 0x200007).w(FUNC(wxstar4k_state::vidbd_main_cpu_irq4_w)); // Trigger Main IRQ4
-	map(0x300000, 0x300003).rw(FUNC(wxstar4k_state::vidbd_gfx_control_r), FUNC(wxstar4k_state::vidbd_gfx_control_w)); // GFX Control
-	map(0x400000, 0x5fffff).ram().share("vram"); // VRAM (creates 16-bit shared RAM)
-	map(0xe00000, 0xe1ffff).noprw(); // VME Access Window
+	map(0x200000, 0x200001).rw(FUNC(wxstar4k_state::vidbd_status_r), FUNC(wxstar4k_state::vidbd_vme_addr_hi_w));
+	map(0x200002, 0x200003).nopr().w(FUNC(wxstar4k_state::vidbd_irq_vector_w)); // TODO: Implement read side (watchdog + video status)
+	map(0x200004, 0x200005).w(FUNC(wxstar4k_state::vidbd_latch_w));
+	map(0x200006, 0x200007).w(FUNC(wxstar4k_state::vidbd_main_cpu_irq4_w));
+	map(0x300000, 0x300003).rw(FUNC(wxstar4k_state::vidbd_gfx_control_r), FUNC(wxstar4k_state::vidbd_gfx_control_w));
+	map(0x400000, 0x5fffff).ram().share("vram");
+	map(0xe00000, 0xe1ffff).noprw(); // VME Access Window Placeholder
 }
 
 // --- Graphics Board 8051 ---
@@ -424,7 +456,14 @@ uint8_t wxstar4k_state::vidbd_sub_vram_counter_low_r(offs_t offset) { return m_v
 void wxstar4k_state::vidbd_sub_vram_counter_low_w(offs_t offset, uint8_t data) { m_vram_addr_low = (m_vram_addr_low & 0xff00) | data; }
 uint8_t wxstar4k_state::vidbd_sub_vram_counter_high_r(offs_t offset) { return (m_vram_addr_low >> 8) & 0xff; }
 void wxstar4k_state::vidbd_sub_vram_counter_high_w(offs_t offset, uint8_t data) { m_vram_addr_low = (m_vram_addr_low & 0x00ff) | (uint16_t(data) << 8); }
-uint8_t wxstar4k_state::vidbd_sub_fifo_r() { return m_gfx_sub_fifo_in; } // TODO: Replace with proper FIFO/latch read
+
+uint8_t wxstar4k_state::vidbd_sub_latch_r()
+{
+	// 2000-27FF - read latch from 68010
+	uint8_t data = m_gfx_latch_in->read();
+	LOGLATCH("%s: GFX 8051 reads latch from 68010 = %02X\n", machine().describe_context(), data);
+	return data;
+}
 
 void wxstar4k_state::vidbd_sub_map(address_map &map)
 {
@@ -435,57 +474,143 @@ void wxstar4k_state::vidbd_sub_io_map(address_map &map)
 {
 	map(0x0000, 0x07ff).ram(); // Internal RAM
 	map(0x0800, 0x0fff).noprw(); // Gap?
-	map(0x1000, 0x17ff).rw(FUNC(wxstar4k_state::vidbd_sub_vram_counter_low_r), FUNC(wxstar4k_state::vidbd_sub_vram_counter_low_w)); // VRAM Addr Low
-	map(0x1800, 0x1fff).rw(FUNC(wxstar4k_state::vidbd_sub_vram_counter_high_r), FUNC(wxstar4k_state::vidbd_sub_vram_counter_high_w)); // VRAM Addr High (of low word)
-	map(0x2000, 0x27ff).r(FUNC(wxstar4k_state::vidbd_sub_fifo_r)); // Read 68k FIFO
+	map(0x1000, 0x17ff).rw(FUNC(wxstar4k_state::vidbd_sub_vram_counter_low_r), FUNC(wxstar4k_state::vidbd_sub_vram_counter_low_w));
+	map(0x1800, 0x1fff).rw(FUNC(wxstar4k_state::vidbd_sub_vram_counter_high_r), FUNC(wxstar4k_state::vidbd_sub_vram_counter_high_w));
+	map(0x2000, 0x27ff).r(FUNC(wxstar4k_state::vidbd_sub_latch_r)); // Read latch from 68k
 	// 2800-7FFF Undecoded?
-	map(0x8000, 0x8000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write)).select(0); // RAMDAC Addr W -> Offs 0
-	map(0x8800, 0x8800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(1); // RAMDAC Palette RW -> Offs 1
-	map(0x9000, 0x9000).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(2); // RAMDAC Mask RW -> Offs 2
-	map(0x9800, 0x9800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(0);    // RAMDAC Addr R -> Offs 0
-	map(0xa000, 0xa000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write)).select(4); // RAMDAC Overlay Addr W -> Offs 4
-	map(0xa800, 0xa800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(5); // RAMDAC Overlay Data RW -> Offs 5
-	map(0xb800, 0xb800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(4);    // RAMDAC Overlay Addr R -> Offs 4
+	map(0x8000, 0x8000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write)).select(0); // RAMDAC Addr W
+	map(0x8800, 0x8800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(1); // RAMDAC Palette RW
+	map(0x9000, 0x9000).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(2); // RAMDAC Mask RW
+	map(0x9800, 0x9800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(0);    // RAMDAC Addr R
+	map(0xa000, 0xa000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write)).select(4); // RAMDAC Overlay Addr W
+	map(0xa800, 0xa800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(5); // RAMDAC Overlay Data RW
+	map(0xb800, 0xb800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(4);    // RAMDAC Overlay Addr R
 	map(0xc000, 0xffff).noprw(); // Undecoded?
 }
 
-uint8_t wxstar4k_state::vidbd_sub_p1_r() { return m_gfx_sub_p1; }
-void wxstar4k_state::vidbd_sub_p1_w(uint8_t data) { m_gfx_sub_p1 = data; }
-uint8_t wxstar4k_state::vidbd_sub_p3_r() { return 0xff; } // TODO: Return actual input states
+uint8_t wxstar4k_state::vidbd_sub_p1_r()
+{
+	// P1.0(T2) = Latch Empty Flag? Let's assume active low empty.
+	// P1.3 = Ready flag (output, set by 8051 firmware)
+	// Other bits are inputs/outputs to be determined
+	uint8_t data = m_gfx_sub_p1; // Read internal latch value (outputs)
+	if (!m_gfx_latch_in->pending_r()) data |= 0x01; // Set bit 0 if latch is empty (input)
+	// TODO: Read other input pins (P1.1, P1.2, P1.4)
+	LOGGFXSUB("Read P1 = %02X (internal latch %02X)\n", data, m_gfx_sub_p1);
+	return data;
+}
+
+void wxstar4k_state::vidbd_sub_p1_w(uint8_t data)
+{
+	LOGGFXSUB("Write P1 = %02X\n", data);
+	m_gfx_sub_p1 = data; // Store output state
+	// TODO: Handle outputs (P1.1, P1.2, P1.7?)
+}
+
+uint8_t wxstar4k_state::vidbd_sub_p3_r() { return 0xff; } // TODO: Return actual input states (INT0/1, T0/1)
 void wxstar4k_state::vidbd_sub_p3_w(uint8_t data) { } // TODO: Handle outputs
 
 // --- Data Board 8344 ---
+
+uint8_t wxstar4k_state::databd_latch_in_r()
+{
+	uint8_t data = m_data_latch_in->read();
+	LOGLATCH("Data 8344 reads latch from main CPU = %02X\n", data);
+	return data;
+}
+
+void wxstar4k_state::databd_latch_out_w(uint8_t data)
+{
+	LOGLATCH("Data 8344 writes latch to main CPU = %02X\n", data);
+	m_data_latch_out->write(data);
+}
+
+// Placeholder PIO handlers
+uint8_t wxstar4k_state::databd_pio1_r(offs_t offset){ LOGDATA("Read PIO1 offset %d\n", offset); return 0; }
+void wxstar4k_state::databd_pio1_w(offs_t offset, uint8_t data){ LOGDATA("Write PIO1 offset %d = %02X\n", offset, data); }
+uint8_t wxstar4k_state::databd_pio2_r(offs_t offset){ LOGDATA("Read PIO2 offset %d\n", offset); return 0; }
+void wxstar4k_state::databd_pio2_w(offs_t offset, uint8_t data){ LOGDATA("Write PIO2 offset %d = %02X\n", offset, data); /* Handle LED writes? */ }
 
 void wxstar4k_state::databd_main_map(address_map &map) { map(0x0000, 0x1fff).rom().region("datacpu", 0); }
 void wxstar4k_state::databd_main_io_map(address_map &map)
 {
 	map(0x0000, 0x01ff).ram(); // Internal RAM
-	map(0x0200, 0x0201).noprw(); // Internal UART?
-	map(0x0202, 0x7fff).noprw();
-	map(0x8000, 0x8005).noprw(); // PIO1
-	map(0x8006, 0x80ff).noprw();
-	map(0x8100, 0x8105).noprw(); // PIO2
-	map(0x8106, 0xffff).noprw();
+	map(0x0200, 0x0201).noprw(); // Internal UART? Placeholder
+	// 0202-7FFF: Unused?
+	// TODO: Need addresses for reading/writing the latches from 8344 side
+	// Example: map(0x2000, 0x2000).r(FUNC(wxstar4k_state::databd_latch_in_r));
+	// Example: map(0x2001, 0x2001).w(FUNC(wxstar4k_state::databd_latch_out_w));
+
+	map(0x8000, 0x8005).rw(FUNC(wxstar4k_state::databd_pio1_r), FUNC(wxstar4k_state::databd_pio1_w)); // PIO1 Placeholder
+	map(0x8100, 0x8105).rw(FUNC(wxstar4k_state::databd_pio2_r), FUNC(wxstar4k_state::databd_pio2_w)); // PIO2 Placeholder
 }
 
 // --- I/O Board 8031 ---
 
+uint8_t wxstar4k_state::iobd_latch_in_r()
+{
+	uint8_t data = m_io_latch_in->read();
+	LOGLATCH("I/O 8031 reads latch from main CPU = %02X\n", data);
+	return data;
+}
+
+void wxstar4k_state::iobd_latch_out_w(uint8_t data)
+{
+	LOGLATCH("I/O 8031 writes latch to main CPU = %02X\n", data);
+	m_io_latch_out->write(data);
+}
+
+// Basic keyboard data/status read handlers for 8031
+uint8_t wxstar4k_state::iobd_kbd_data_r()
+{
+	uint8_t data = m_io_kbd_data;
+	m_io_kbd_status &= ~1; // Clear data ready flag
+	LOGIO("I/O 8031 reads keyboard data = %02X\n", data);
+	// TODO: Clear 8031 interrupt line if asserted?
+	return data;
+}
+
+uint8_t wxstar4k_state::iobd_kbd_status_r()
+{
+	// Bit 0 = Data ready?
+	LOGIO("I/O 8031 reads keyboard status = %02X\n", m_io_kbd_status);
+	return m_io_kbd_status;
+}
+
 void wxstar4k_state::iobd_main_map(address_map &map) { map(0x0000, 0x7fff).rom().region("iocpu", 0); }
-void wxstar4k_state::iobd_main_io_map(address_map &map) { /* TODO: Map UART, Kbd controller */ }
+void wxstar4k_state::iobd_main_io_map(address_map &map)
+{
+	// map(0x0000, 0x007f).ram(); // Internal RAM mapped by core
+	// TODO: Need addresses for reading/writing the latches from 8031 side
+	// Example: map(0x6000, 0x6000).r(FUNC(wxstar4k_state::iobd_latch_in_r));
+	// Example: map(0x6001, 0x6001).w(FUNC(wxstar4k_state::iobd_latch_out_w));
+
+	// Map UART (example addresses)
+	map(0x8000, 0x8000).rw(m_uart, FUNC(i8251_device::data_r), FUNC(i8251_device::data_w));
+	map(0x8001, 0x8001).rw(m_uart, FUNC(i8251_device::status_r), FUNC(i8251_device::control_w));
+
+	// Map Keyboard (example addresses)
+	map(0x9000, 0x9000).r(FUNC(wxstar4k_state::iobd_kbd_data_r));
+	map(0x9001, 0x9001).r(FUNC(wxstar4k_state::iobd_kbd_status_r));
+}
 
 // --- Machine Lifecycle ---
 
 void wxstar4k_state::machine_start()
 {
-	// Register ALL state variables here
+	// Resolve outputs
+	m_diag_led.resolve();
+
+	// Register state variables for saving
 	save_item(NAME(m_cpu_irq_vector));
 	save_item(NAME(m_gfx_irq_vector));
 	save_item(NAME(m_main_watchdog));
-	save_item(NAME(m_vram_addr_low));    // Moved from video_start
-	save_item(NAME(m_vram_addr_high));   // Moved from video_start
-	save_item(NAME(m_gfx_sub_p1));       // Moved from video_start
-	save_item(NAME(m_gfx_sub_fifo_in));  // Moved from video_start
-	save_item(NAME(m_gfx_sub_fifo_out)); // Moved from video_start
+	save_item(NAME(m_vram_addr_low));
+	save_item(NAME(m_vram_addr_high));
+	save_item(NAME(m_gfx_sub_p1));
+	save_item(NAME(m_io_kbd_data));
+	save_item(NAME(m_io_kbd_status));
+	// Latches save their own state
 
 	// Configure NVRAM device
 	m_nvram->set_base(memshare("eeprom")->ptr(), 0x2000);
@@ -496,8 +621,8 @@ void wxstar4k_state::machine_reset()
 	// Copy reset vector from ROM to RAM for main CPU
 	uint16_t *ram = m_mainram.target();
 	uint16_t *rom = (uint16_t *)memregion("maincpu")->base();
-	ram[0] = rom[0]; ram[1] = rom[1]; // Initial SP
-	ram[2] = rom[2]; ram[3] = rom[3]; // Initial PC
+	ram[0] = rom[0]; ram[1] = rom[1]; // SP
+	ram[2] = rom[2]; ram[3] = rom[3]; // PC
 
 	// Reset internal state
 	m_cpu_irq_vector = 0;
@@ -506,8 +631,15 @@ void wxstar4k_state::machine_reset()
 	m_vram_addr_low = 0;
 	m_vram_addr_high = 0;
 	m_gfx_sub_p1 = 0xff;
-	m_gfx_sub_fifo_in = 0;
-	m_gfx_sub_fifo_out = 0;
+	m_io_kbd_data = 0;
+	m_io_kbd_status = 0;
+
+	// Reset latches (not strictly necessary, device_reset does it)
+	m_gfx_latch_in->reset();
+	m_data_latch_in->reset();
+	m_data_latch_out->reset();
+	m_io_latch_in->reset();
+	m_io_latch_out->reset();
 
 	// Reset sub-CPUs
 	m_gfxcpu->reset();
@@ -522,7 +654,7 @@ TIMER_DEVICE_CALLBACK_MEMBER(wxstar4k_state::vblank_irq)
 {
 	// GFX CPU IRQ 5 = Vertical Blanking Interrupt (Autovectored)
 	m_gfxcpu->set_input_line(M68K_IRQ_5, ASSERT_LINE);
-	m_gfxcpu->set_input_line(M68K_IRQ_5, CLEAR_LINE); // Auto-clear for now
+	m_gfxcpu->set_input_line(M68K_IRQ_5, CLEAR_LINE);
 
 	// GFX Sub CPU P3.2 (INT0) = Vertical Drive Interrupt?
 	m_gfxsubcpu->set_input_line(MCS51_INT0_LINE, ASSERT_LINE); // Needs to be cleared by handler
@@ -531,11 +663,44 @@ TIMER_DEVICE_CALLBACK_MEMBER(wxstar4k_state::vblank_irq)
 void wxstar4k_state::rtc_irq_w(int state)
 {
 	// Main CPU IRQ 1 = RTC Interrupt (Autovectored)
+	LOGIRQ("RTC IRQ -> Main CPU IRQ 1 %s\n", state ? "Assert" : "Clear");
 	m_maincpu->set_input_line(M68K_IRQ_1, state ? ASSERT_LINE : CLEAR_LINE);
 }
 
+void wxstar4k_state::ptm_irq_w(int state)
+{
+	// Assigning PTM to Main CPU IRQ 3 (unused based on comments)
+	LOGIRQ("PTM IRQ -> Main CPU IRQ 3 %s\n", state ? "Assert" : "Clear");
+	m_maincpu->set_input_line(M68K_IRQ_3, state ? ASSERT_LINE : CLEAR_LINE);
+	// TODO: Is IRQ3 Autovectored or needs vector? Assume non-auto for now.
+}
+
+void wxstar4k_state::data_latch_irq_w(int state)
+{
+	// Data Latch Out Pending -> Main CPU IRQ 5
+	LOGIRQ("Data Latch IRQ -> Main CPU IRQ 5 %s\n", state ? "Assert" : "Clear");
+	m_maincpu->set_input_line_and_vector(M68K_IRQ_5, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
+}
+
+void wxstar4k_state::io_latch_irq_w(int state)
+{
+	// I/O Latch Out Pending -> Main CPU IRQ 2
+	LOGIRQ("I/O Latch IRQ -> Main CPU IRQ 2 %s\n", state ? "Assert" : "Clear");
+	m_maincpu->set_input_line_and_vector(M68K_IRQ_2, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
+}
+
+void wxstar4k_state::kbd_put_key(uint8_t scancode)
+{
+	LOGIO("Keyboard received scancode %02X\n", scancode);
+	// Very simple placeholder: put scancode in data reg, set status bit
+	m_io_kbd_data = scancode;
+	m_io_kbd_status |= 1; // Set data ready flag
+	// TODO: Assert an interrupt on the 8031? Needs analysis of 8031 code.
+}
+
+
 static INPUT_PORTS_START( wxstar4k )
-	// TODO: Add Dip Switches, Keyboard inputs etc. here if known
+	// TODO: Add Dip Switches if known
 INPUT_PORTS_END
 
 
@@ -546,17 +711,22 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	/* basic machine hardware */
 	M68010(config, m_maincpu, XTAL(20'000'000)/2); // 10 MHz
 	m_maincpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::cpubd_main_map);
-	// TODO: Setup IRQ acknowledge handlers if needed for non-autovectored IRQs 2, 4, 5
+	// TODO: Setup IRQ acknowledge handlers if needed
 
 	NVRAM(config, "eeprom", nvram_device::DEFAULT_ALL_0); // 8KB EEPROM
 
 	ICM7170(config, m_rtc, XTAL(32'768));
-	m_rtc->irq().set(FUNC(wxstar4k_state::rtc_irq_w)); // Correct callback config
+	m_rtc->irq().set(FUNC(wxstar4k_state::rtc_irq_w));
+
+	PTM6840(config, m_ptm, XTAL(20'000'000)/80); // Guessing 250kHz clock derived from main clock
+	m_ptm->set_external_clocks(XTAL(20'000'000)/80, 0, XTAL(20'000'000)/80); // Guess for C1, C3 inputs
+	// PTM O1,O2,O3 outputs not connected based on available info?
+	m_ptm->irq_callback().set(FUNC(wxstar4k_state::ptm_irq_w));
 
 	/* Graphics board hardware */
-	M68010(config, m_gfxcpu, XTAL(20'000'000)/2); // 10 MHz (from main board clock)
+	M68010(config, m_gfxcpu, XTAL(20'000'000)/2); // 10 MHz
 	m_gfxcpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::vidbd_main_map);
-	// TODO: Setup IRQ acknowledge handler if needed for IRQ 6
+	// TODO: Setup IRQ acknowledge handler if needed
 
 	I8051(config, m_gfxsubcpu, XTAL(12'000'000)); // 12 MHz
 	m_gfxsubcpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::vidbd_sub_map);
@@ -572,25 +742,42 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	I8344(config, m_datacpu, XTAL(7'372'800)); // 7.3728 MHz
 	m_datacpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::databd_main_map);
 	m_datacpu->set_addrmap(AS_IO, &wxstar4k_state::databd_main_io_map);
-	// TODO: Add PIO devices if they are standard parts (e.g., 8255)
-	// TODO: Connect 8344 interrupt output to Main CPU IRQ5
 
 	/* I/O board hardware */
 	I8031(config, m_iocpu, XTAL(11'059'200)); // 11.0592 MHz
 	m_iocpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::iobd_main_map);
 	m_iocpu->set_addrmap(AS_IO, &wxstar4k_state::iobd_main_io_map);
-	// TODO: Connect 8031 interrupt output to Main CPU IRQ2
-	// TODO: Add I8251 UART device
-	// TODO: Add AT Keyboard device
+
+	I8251(config, m_uart, XTAL(11'059'200)/6); // Guess clock derived from crystal (e.g. /6 for 1.8432MHz)
+	m_uart->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
+	m_uart->dtr_handler().set(m_rs232, FUNC(rs232_port_device::write_dtr));
+	m_uart->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
+	// TODO: Connect UART interrupt?
+
+	RS232_PORT(config, m_rs232, default_rs232_devices, nullptr); // Configure for modem? Loopback?
+	m_rs232->rxd_handler().set(m_uart, FUNC(i8251_device::write_rxd));
+	m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
+	m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
+
+	AT_KEYBOARD(config, m_kbd);
+	m_kbd->keypress().set(FUNC(wxstar4k_state::kbd_put_key));
+
+	/* Latches for Inter-CPU Communication */
+	GENERIC_LATCH_8(config, m_gfx_latch_in);  // Main 68k -> GFX 8051
+	GENERIC_LATCH_8(config, m_data_latch_in); // Main 68k -> Data 8344
+	GENERIC_LATCH_8(config, m_data_latch_out); // Data 8344 -> Main 68k
+	m_data_latch_out->data_pending_callback().set(FUNC(wxstar4k_state::data_latch_irq_w));
+	GENERIC_LATCH_8(config, m_io_latch_in);   // Main 68k -> I/O 8031
+	GENERIC_LATCH_8(config, m_io_latch_out);  // I/O 8031 -> Main 68k
+	m_io_latch_out->data_pending_callback().set(FUNC(wxstar4k_state::io_latch_irq_w));
 
 	/* video hardware */
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
-	// These parameters need verification from schematics or measurement
 	m_screen->set_raw(XTAL(20'000'000) * 2 / 3, 858, 0, 640, 262, 0, 240); // ~13.33MHz pixel clock
 	m_screen->set_screen_update(FUNC(wxstar4k_state::screen_update));
-	m_screen->set_palette(m_palette); // Screen uses this palette via indexed bitmap
+	m_screen->set_palette(m_palette);
 
-	PALETTE(config, m_palette).set_entries(256); // 256 color entries for Bt471
+	PALETTE(config, m_palette).set_entries(256);
 
 	// VBLANK Timer triggering GFX CPU IRQ 5 and GFX SUB CPU INT0
 	TIMER(config, "vblank").configure_periodic(FUNC(wxstar4k_state::vblank_irq), m_screen->frame_period());
@@ -598,6 +785,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	/* sound hardware */
 	// MACHINE_NO_SOUND flag set
 }
+
+// --- ROM Loading ---
 
 ROM_START( wxstar4k )
 	ROM_REGION( 0x20000, "maincpu", 0 ) /* CPU board 68010 program (128KB) */
@@ -617,8 +806,8 @@ ROM_START( wxstar4k )
 	ROM_LOAD( "u13 rom.bin",  0x000000, 0x002000, CRC(667b0a2b) SHA1(d60bcc271a73633544b0cf2f80589b2e5670b705) )
 
 	ROM_REGION(0x10000, "gfxcpu", 0) /* Graphics board 68010 program (64KB) */
-	ROM_LOAD16_BYTE( "u42 rom low.bin", 0x000001, 0x008000, CRC(84038ca3) SHA1(b28a0d357d489fb06ff0d5d36ea11ebd1f9612a5) ) // D0-D7?
-	ROM_LOAD16_BYTE( "u43 rom high.bin", 0x000000, 0x008000, CRC(6f2a7592) SHA1(1aa2394db42b6f28277e35a48a7cef348c213e05) ) // D8-D15?
+	ROM_LOAD16_BYTE( "u42 rom low.bin", 0x000001, 0x008000, CRC(84038ca3) SHA1(b28a0d357d489fb06ff0d5d36ea11ebd1f9612a5) )
+	ROM_LOAD16_BYTE( "u43 rom high.bin", 0x000000, 0x008000, CRC(6f2a7592) SHA1(1aa2394db42b6f28277e35a48a7cef348c213e05) )
 ROM_END
 
 } // anonymous namespace

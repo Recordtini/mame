@@ -9,7 +9,7 @@
     ... (Header comments remain the same) ...
 
    TODO:
-   - Implement detailed I/O registers for Data board PIOs, I/O board UART/Kbd comms
+   - Implement detailed I/O registers for Data board PIOs, I/O board UART comms
    - Implement shared memory access control/arbitration if needed (VME bus?)
    - Implement Data 8344 SDLC communication (satellite feed)
    - Implement audio tone generation
@@ -18,11 +18,12 @@
    - Verify screen parameters and VRAM mapping
    - Verify Bt471 register mapping (pixel mask, overlay addr vs data)
    - Implement vector acknowledge handlers if needed
+   - Re-add Keyboard support
 
 ***************************************************************************/
 
 #include "emu.h"
-// #include "emu/driver.h" // REMOVE THIS LINE
+// #include "emu/driver.h" // Removed - Was incorrect
 #include "cpu/m68000/m68010.h"
 #include "cpu/mcs51/mcs51.h"
 #include "machine/gen_latch.h"
@@ -36,7 +37,7 @@
 #include "machine/6840ptm.h"
 #include "machine/i8251.h"
 #include "bus/rs232/rs232.h"
-#include "bus/pc_kbd/keyboards.h" // Ensure this line uses the correct path
+// #include "bus/pc_kbd/keyboards.h" // Removed keyboard include
 
 #define LOG_CPU_IO (1U << 1)
 #define LOG_GFX_IO (1U << 2)
@@ -63,7 +64,7 @@
 // Device Tags
 #define PTM_TAG "u51_ptm"
 #define UART_TAG "u5_uart"
-#define KBD_TAG "kbd"
+//#define KBD_TAG "kbd" // Removed
 #define RS232_TAG "serport"
 #define GFX_LATCH_IN_TAG "gfxlatch_in"
 #define DATA_LATCH_IN_TAG "datalatch_in"
@@ -77,9 +78,8 @@ namespace {
 class wxstar4k_state : public driver_device
 {
 public:
-	// Constructor - Base class must be initialized FIRST
 	wxstar4k_state(const machine_config &mconfig, device_type type, const char *tag) :
-		driver_device(mconfig, type, tag), // Initialize base driver_device
+		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
 		m_gfxcpu(*this, "gfxcpu"),
 		m_gfxsubcpu(*this, "gfxsubcpu"),
@@ -96,7 +96,7 @@ public:
 		m_ptm(*this, PTM_TAG),
 		m_uart(*this, UART_TAG),
 		m_rs232(*this, RS232_TAG),
-		m_kbd(*this, KBD_TAG), // Initialize after base class
+		// m_kbd(*this, KBD_TAG), // Removed
 		m_gfx_latch_in(*this, GFX_LATCH_IN_TAG),
 		m_data_latch_in(*this, DATA_LATCH_IN_TAG),
 		m_data_latch_out(*this, DATA_LATCH_OUT_TAG),
@@ -106,9 +106,8 @@ public:
 		m_cpu_irq_vector(0),
 		m_gfx_irq_vector(0),
 		m_gfx_sub_p1(0xff),
-		m_main_watchdog(0),
-		m_io_kbd_data(0),
-		m_io_kbd_status(0)
+		m_main_watchdog(0)
+		// Removed kbd state vars
 	{ }
 
 	void wxstar4k(machine_config &config);
@@ -148,7 +147,7 @@ private:
 	required_device<ptm6840_device> m_ptm;
 	required_device<i8251_device> m_uart;
 	required_device<rs232_port_device> m_rs232;
-	required_device<at_keyboard_device> m_kbd; // Type name seems correct
+	// required_device<at_keyboard_device> m_kbd; // Removed
 	required_device<generic_latch_8_device> m_gfx_latch_in;
 	required_device<generic_latch_8_device> m_data_latch_in;
 	required_device<generic_latch_8_device> m_data_latch_out;
@@ -164,8 +163,7 @@ private:
 	uint16_t m_vram_addr_low = 0;
 	uint16_t m_vram_addr_high = 0;
 	uint8_t m_main_watchdog;
-	uint8_t m_io_kbd_data;
-	uint8_t m_io_kbd_status;
+	// Removed kbd state vars
 
 	// CPU Board I/O Handlers
 	uint16_t buserr_r();
@@ -207,8 +205,7 @@ private:
 	// I/O Board 8031 Handlers
 	uint8_t iobd_latch_in_r();
 	void iobd_latch_out_w(uint8_t data);
-	uint8_t iobd_kbd_data_r();
-	uint8_t iobd_kbd_status_r();
+	// Removed kbd handlers
 
 	// Interrupt handling & Callbacks
 	TIMER_DEVICE_CALLBACK_MEMBER(vblank_irq);
@@ -216,11 +213,9 @@ private:
 	void ptm_irq_w(int state);
 	void data_latch_irq_w(int state);
 	void io_latch_irq_w(int state);
-	void kbd_put_key(uint8_t scancode);
+	// Removed kbd callback
 	void led_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 };
-
-// ... (Rest of file remains the same) ...
 
 // --- Video ---
 
@@ -263,83 +258,13 @@ uint16_t wxstar4k_state::buserr_r()
 	}
 	return 0xffff;
 }
-
-void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask)
-{
-	if (ACCESSING_BITS_0_7)
-	{
-		LOGCPU("LED: %02x\n", data & 0xff);
-		for(int i=0; i<8; i++)
-			m_diag_led[i] = BIT(data, i);
-	}
-}
-
-void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask)
-{
-	LOGCPU("Watchdog reset write: %04X & %04X\n", data, mem_mask);
-	m_main_watchdog = 0;
-}
-
-void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask)
-{
-	if (ACCESSING_BITS_0_15 && offset == 0)
-	{
-		LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6\n", machine().describe_context());
-		m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector);
-	}
-	else
-	{
-		LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask);
-	}
-}
-
-uint16_t wxstar4k_state::cpubd_io_status_r()
-{
-	uint16_t status = m_io_latch_out->pending_r() ? 1 : 0; // Bit 0 = data pending from IO board
-	LOGCPU("%s: Read from I/O card status @ C00000 = %04X\n", machine().describe_context(), status);
-	return status;
-}
-
-void wxstar4k_state::cpubd_io_control_w(offs_t offset, uint16_t data, uint16_t mem_mask)
-{
-	if (ACCESSING_BITS_0_7)
-	{
-		uint8_t byte_data = data & 0xff;
-		LOGLATCH("Write to I/O card control/data @ C00000: data %02X -> Latch In\n", byte_data);
-		m_io_latch_in->write(byte_data);
-	}
-}
-
-uint16_t wxstar4k_state::cpubd_data_latch_r()
-{
-	uint16_t data = m_data_latch_out->read();
-	LOGLATCH("%s: Read byte from Data card latch @ C0A400 = %02X\n", machine().describe_context(), data & 0xff);
-	return data;
-}
-
-void wxstar4k_state::cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask)
-{
-	if (ACCESSING_BITS_0_7)
-	{
-		uint8_t byte_data = data & 0xff;
-		if (offset == 0 || offset == 0x100)
-		{
-			LOGLATCH("Write byte to Data card latch @ %08X: data %02X\n", 0xC0A000 + (offset*2), byte_data);
-			m_data_latch_in->write(byte_data);
-		}
-		else if (offset == 0x300)
-		{
-			LOGCPU("Write byte to audio control latch 1 @ C0A600: data %02X\n", byte_data);
-		}
-		else if (offset == 0x400)
-		{
-			LOGCPU("Write byte to audio control latch 2 @ C0A800: data %02X\n", byte_data);
-		}
-	} else {
-		LOGCPU("Write to Data card area offset %X: data %04X & %04X\n", offset*2, data, mem_mask);
-	}
-}
-
+void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { LOGCPU("LED: %02x\n", data & 0xff); for(int i=0; i<8; i++) m_diag_led[i] = BIT(data, i); } }
+void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask) { LOGCPU("Watchdog reset write: %04X & %04X\n", data, mem_mask); m_main_watchdog = 0; }
+void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_15 && offset == 0) { LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6\n", machine().describe_context()); m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector); } else { LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask); } }
+uint16_t wxstar4k_state::cpubd_io_status_r() { uint16_t status = m_io_latch_out->pending_r() ? 1 : 0; LOGCPU("%s: Read from I/O card status @ C00000 = %04X\n", machine().describe_context(), status); return status; }
+void wxstar4k_state::cpubd_io_control_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { LOGLATCH("Write to I/O card control/data @ C00000: data %02X -> Latch In\n", data & 0xff); m_io_latch_in->write(data & 0xff); } }
+uint16_t wxstar4k_state::cpubd_data_latch_r() { uint16_t data = m_data_latch_out->read(); LOGLATCH("%s: Read byte from Data card latch @ C0A400 = %02X\n", machine().describe_context(), data & 0xff); return data; }
+void wxstar4k_state::cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { uint8_t byte_data = data & 0xff; if (offset == 0 || offset == 0x100) { LOGLATCH("Write byte to Data card latch @ %08X: data %02X\n", 0xC0A000 + (offset*2), byte_data); m_data_latch_in->write(byte_data); } else if (offset == 0x300) { LOGCPU("Write byte to audio control latch 1 @ C0A600: data %02X\n", byte_data); } else if (offset == 0x400) { LOGCPU("Write byte to audio control latch 2 @ C0A800: data %02X\n", byte_data); } } else { LOGCPU("Write to Data card area offset %X: data %04X & %04X\n", offset*2, data, mem_mask); } }
 
 void wxstar4k_state::cpubd_main_map(address_map &map)
 {
@@ -353,7 +278,7 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 	map(0xc0a802, 0xfcffff).r(FUNC(wxstar4k_state::buserr_r));
 	map(0xfd0000, 0xfd1fff).ram().share("eeprom");
 	map(0xfd1fff, 0xfd1fff).w(FUNC(wxstar4k_state::led_w));
-	map(0xfd8000, 0xfd800f).rw(m_ptm, FUNC(ptm6840_device::read), FUNC(ptm6840_device::write)).umask16(0x00ff); // PTM @ Guessed addr
+	map(0xfd8000, 0xfd800f).rw(m_ptm, FUNC(ptm6840_device::read), FUNC(ptm6840_device::write)).umask16(0x00ff);
 	map(0xfdf000, 0xfdf007).w(FUNC(wxstar4k_state::cpubd_gfx_irq6_w));
 	map(0xfdf008, 0xfdf009).w(FUNC(wxstar4k_state::cpubd_watchdog_reset_w));
 	map(0xfdf00a, 0xfdffbf).r(FUNC(wxstar4k_state::buserr_r));
@@ -364,14 +289,7 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 
 // --- Graphics Board 68010 ---
 
-uint16_t wxstar4k_state::vidbd_status_r()
-{
-	uint16_t status = 0;
-	if (!m_gfx_latch_in->pending_r()) status |= 0x0001;
-	if (m_gfx_sub_p1 & 0x08) status |= 0x0002;
-	LOGGFX("%s: Read GFX Status @ 200000 = %04X\n", machine().describe_context(), status);
-	return status;
-}
+uint16_t wxstar4k_state::vidbd_status_r() { uint16_t status = 0; if (!m_gfx_latch_in->pending_r()) status |= 0x0001; if (m_gfx_sub_p1 & 0x08) status |= 0x0002; LOGGFX("%s: Read GFX Status @ 200000 = %04X\n", machine().describe_context(), status); return status; }
 void wxstar4k_state::vidbd_vme_addr_hi_w(offs_t offset, uint16_t data, uint16_t mem_mask) { LOGGFX("Write GFX VME Addr Hi @ 200000: data %04X & %04X\n", data, mem_mask); }
 void wxstar4k_state::vidbd_irq_vector_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { m_cpu_irq_vector = data & 0xff; LOGIRQ("GFX CPU set Main CPU IRQ4 vector to %02X\n", m_cpu_irq_vector); } }
 void wxstar4k_state::vidbd_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { LOGLATCH("Write GFX 8051 latch @ 200004: data %02X\n", data & 0xff); m_gfx_latch_in->write(data & 0xff); } }
@@ -446,8 +364,7 @@ void wxstar4k_state::databd_main_io_map(address_map &map)
 
 uint8_t wxstar4k_state::iobd_latch_in_r() { uint8_t data = m_io_latch_in->read(); LOGLATCH("I/O 8031 reads latch from main CPU = %02X\n", data); return data; }
 void wxstar4k_state::iobd_latch_out_w(uint8_t data) { LOGLATCH("I/O 8031 writes latch to main CPU = %02X\n", data); m_io_latch_out->write(data); }
-uint8_t wxstar4k_state::iobd_kbd_data_r() { uint8_t data = m_io_kbd_data; m_io_kbd_status &= ~1; LOGIO("I/O 8031 reads keyboard data = %02X\n", data); return data; }
-uint8_t wxstar4k_state::iobd_kbd_status_r() { LOGIO("I/O 8031 reads keyboard status = %02X\n", m_io_kbd_status); return m_io_kbd_status; }
+// Removed kbd handlers
 
 void wxstar4k_state::iobd_main_map(address_map &map) { map(0x0000, 0x7fff).rom().region("iocpu", 0); }
 void wxstar4k_state::iobd_main_io_map(address_map &map)
@@ -456,8 +373,7 @@ void wxstar4k_state::iobd_main_io_map(address_map &map)
 	map(0x6001, 0x6001).w(FUNC(wxstar4k_state::iobd_latch_out_w)); // Guessed addr
 	map(0x8000, 0x8000).rw(m_uart, FUNC(i8251_device::data_r), FUNC(i8251_device::data_w));
 	map(0x8001, 0x8001).rw(m_uart, FUNC(i8251_device::status_r), FUNC(i8251_device::control_w));
-	map(0x9000, 0x9000).r(FUNC(wxstar4k_state::iobd_kbd_data_r));
-	map(0x9001, 0x9001).r(FUNC(wxstar4k_state::iobd_kbd_status_r));
+	// Removed kbd mappings
 }
 
 // --- Machine Lifecycle ---
@@ -471,8 +387,7 @@ void wxstar4k_state::machine_start()
 	save_item(NAME(m_vram_addr_low));
 	save_item(NAME(m_vram_addr_high));
 	save_item(NAME(m_gfx_sub_p1));
-	save_item(NAME(m_io_kbd_data));
-	save_item(NAME(m_io_kbd_status));
+	// Removed kbd state save_items
 	m_nvram->set_base(memshare("eeprom")->ptr(), 0x2000);
 }
 
@@ -488,8 +403,7 @@ void wxstar4k_state::machine_reset()
 	m_vram_addr_low = 0;
 	m_vram_addr_high = 0;
 	m_gfx_sub_p1 = 0xff;
-	m_io_kbd_data = 0;
-	m_io_kbd_status = 0;
+	// Removed kbd state reset
 	m_gfxcpu->reset();
 	m_gfxsubcpu->reset();
 	m_datacpu->reset();
@@ -512,7 +426,7 @@ void wxstar4k_state::rtc_irq_w(int state)
 void wxstar4k_state::ptm_irq_w(int state)
 {
 	LOGIRQ("PTM IRQ -> Main CPU IRQ 3 %s\n", state ? "Assert" : "Clear");
-	m_maincpu->set_input_line_and_vector(M68K_IRQ_3, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector); // Assuming vector needed
+	m_maincpu->set_input_line_and_vector(M68K_IRQ_3, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
 }
 void wxstar4k_state::data_latch_irq_w(int state)
 {
@@ -524,17 +438,10 @@ void wxstar4k_state::io_latch_irq_w(int state)
 	LOGIRQ("I/O Latch IRQ -> Main CPU IRQ 2 %s\n", state ? "Assert" : "Clear");
 	m_maincpu->set_input_line_and_vector(M68K_IRQ_2, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
 }
-void wxstar4k_state::kbd_put_key(uint8_t scancode)
-{
-	LOGIO("Keyboard received scancode %02X\n", scancode);
-	m_io_kbd_data = scancode;
-	m_io_kbd_status |= 1;
-	// TODO: Assert 8031 interrupt?
-}
+// Removed kbd callback
 
 static INPUT_PORTS_START( wxstar4k )
-	PORT_START("KEYBOARD") // Tag must match the AT_KEYBOARD device tag
-	PORT_INCLUDE(at_keyboard)
+	// Removed keyboard port definition
 INPUT_PORTS_END
 
 
@@ -575,30 +482,28 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	m_datacpu->set_addrmap(AS_IO, &wxstar4k_state::databd_main_io_map);
 
 	/* I/O board hardware */
-    I8031(config, m_iocpu, XTAL(11'059'200));
-    m_iocpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::iobd_main_map);
-    m_iocpu->set_addrmap(AS_IO, &wxstar4k_state::iobd_main_io_map);
+	I8031(config, m_iocpu, XTAL(11'059'200));
+	m_iocpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::iobd_main_map);
+	m_iocpu->set_addrmap(AS_IO, &wxstar4k_state::iobd_main_io_map);
 
-    I8251(config, m_uart, XTAL(11'059'200)/6);
-    m_uart->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
-    m_uart->dtr_handler().set(m_rs232, FUNC(rs232_port_device::write_dtr));
-    m_uart->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
+	I8251(config, m_uart, XTAL(11'059'200)/6);
+	m_uart->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
+	m_uart->dtr_handler().set(m_rs232, FUNC(rs232_port_device::write_dtr));
+	m_uart->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
 
-    RS232_PORT(config, m_rs232, default_rs232_devices, nullptr);
-    m_rs232->rxd_handler().set(m_uart, FUNC(i8251_device::write_rxd));
-    m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
-    m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
+	RS232_PORT(config, m_rs232, default_rs232_devices, nullptr);
+	m_rs232->rxd_handler().set(m_uart, FUNC(i8251_device::write_rxd));
+	m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
+	m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
 
-    // Use the correct macro and tag for AT Keyboard
-    AT_KEYBOARD(config, KBD_TAG, 0); // Instantiate device with the tag used in the finder
-    m_kbd->keypress().set(FUNC(wxstar4k_state::kbd_put_key)); // Connect callback
+	// Removed AT_KEYBOARD instantiation
 
-    /* Latches for Inter-CPU Communication */
-    GENERIC_LATCH_8(config, m_gfx_latch_in);
-    GENERIC_LATCH_8(config, m_data_latch_in);
-    GENERIC_LATCH_8(config, m_data_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::data_latch_irq_w));
-    GENERIC_LATCH_8(config, m_io_latch_in);
-    GENERIC_LATCH_8(config, m_io_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::io_latch_irq_w));
+	/* Latches for Inter-CPU Communication */
+	GENERIC_LATCH_8(config, m_gfx_latch_in);
+	GENERIC_LATCH_8(config, m_data_latch_in);
+	GENERIC_LATCH_8(config, m_data_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::data_latch_irq_w));
+	GENERIC_LATCH_8(config, m_io_latch_in);
+	GENERIC_LATCH_8(config, m_io_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::io_latch_irq_w));
 
 	/* video hardware */
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);

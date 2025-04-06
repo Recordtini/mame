@@ -148,7 +148,7 @@ private:
 	// Driver overrides
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
-	virtual void video_start() override ATTR_COLD;
+    // virtual void video_start() override ATTR_COLD;
 
 	// Devices
 	required_device<m68010_device> m_maincpu;
@@ -259,15 +259,15 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitm
 	return 0;
 }
 
-void wxstar4k_state::video_start()
-{
-	// VRAM pointer is handled automatically by shared_ptr
-	save_item(NAME(m_vram_addr_low));
-	save_item(NAME(m_vram_addr_high));
-	save_item(NAME(m_gfx_sub_p1));
-	save_item(NAME(m_gfx_sub_fifo_in));
-	save_item(NAME(m_gfx_sub_fifo_out));
-}
+// void wxstar4k_state::video_start()
+// {
+    // VRAM pointer is handled automatically by shared_ptr
+    // save_item(NAME(m_vram_addr_low));   // REMOVE
+    // save_item(NAME(m_vram_addr_high));  // REMOVE
+    // save_item(NAME(m_gfx_sub_p1));      // REMOVE
+    // save_item(NAME(m_gfx_sub_fifo_in)); // REMOVE
+    // save_item(NAME(m_gfx_sub_fifo_out));// REMOVE
+// }
 
 // --- CPU Board ---
 
@@ -477,15 +477,15 @@ void wxstar4k_state::iobd_main_io_map(address_map &map) { /* TODO: Map UART, Kbd
 
 void wxstar4k_state::machine_start()
 {
-	// Register state variables for saving
+	// Register ALL state variables here
 	save_item(NAME(m_cpu_irq_vector));
 	save_item(NAME(m_gfx_irq_vector));
 	save_item(NAME(m_main_watchdog));
-	save_item(NAME(m_vram_addr_low));
-	save_item(NAME(m_vram_addr_high));
-	save_item(NAME(m_gfx_sub_p1));
-	save_item(NAME(m_gfx_sub_fifo_in));
-	save_item(NAME(m_gfx_sub_fifo_out));
+	save_item(NAME(m_vram_addr_low));    // Moved from video_start
+	save_item(NAME(m_vram_addr_high));   // Moved from video_start
+	save_item(NAME(m_gfx_sub_p1));       // Moved from video_start
+	save_item(NAME(m_gfx_sub_fifo_in));  // Moved from video_start
+	save_item(NAME(m_gfx_sub_fifo_out)); // Moved from video_start
 
 	// Configure NVRAM device
 	m_nvram->set_base(memshare("eeprom")->ptr(), 0x2000);

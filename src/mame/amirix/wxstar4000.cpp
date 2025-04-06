@@ -459,7 +459,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	m_rtc->irq().set(FUNC(wxstar4k_state::rtc_irq_w));
 
 	PTM6840(config, m_ptm, XTAL(20'000'000)/80);
-	m_ptm->set_external_clocks(XTAL(20'000'000)/80, 0, XTAL(20'000'000)/80);
+	// Fix: Use .dvalue() to pass clock frequencies as doubles
+	m_ptm->set_external_clocks((XTAL(20'000'000)/80).dvalue(), 0.0, (XTAL(20'000'000)/80).dvalue());
 	m_ptm->irq_callback().set(FUNC(wxstar4k_state::ptm_irq_w));
 
 	/* Graphics board hardware */

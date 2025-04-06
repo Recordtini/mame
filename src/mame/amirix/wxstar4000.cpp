@@ -79,8 +79,8 @@ public:
 	void wxstar4k(machine_config &config);
 
 private:
-	// Screen update
-	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+	// Screen update - Changed bitmap type to bitmap_ind16
+	uint32_t screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
 
 	// Memory Maps
 	void cpubd_main_map(address_map &map) ATTR_COLD;
@@ -182,22 +182,22 @@ uint8_t wxstar4k_state::get_pixel(uint32_t addr)
 	return 0;
 }
 
-uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
+// Changed bitmap type to bitmap_ind16 and updated drawing logic
+uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
 {
-	const pen_t *palette = m_palette->pens();
-	uint32_t vram_addr = 0;
+	uint32_t vram_addr = 0; // Needs to be based on scroll registers / display start address if any
 
 	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 	{
-		uint32_t *scanline = &bitmap.pix(y, cliprect.left());
-		vram_addr = y * 640;
+		uint16_t *scanline = &bitmap.pix(y, cliprect.left()); // Use uint16_t for indexed bitmap
+		vram_addr = y * 640; // Use configured screen width
 		for (int x = cliprect.left(); x <= cliprect.right(); x++)
 		{
 			if (vram_addr < m_vram.bytes()) {
 				uint8_t pixel_data = m_vram[vram_addr++];
-				*scanline++ = palette[pixel_data];
+				*scanline++ = pixel_data; // Write the index directly
 			} else {
-				*scanline++ = rgb_t::black();
+				*scanline++ = 0; // Write index 0 (usually black) for out of bounds
 			}
 		}
 	}
@@ -364,30 +364,11 @@ void wxstar4k_state::vidbd_main_map(address_map &map)
 
 // --- Graphics Board 8051 ---
 
-uint8_t wxstar4k_state::vidbd_sub_vram_counter_low_r(offs_t offset)
-{
-	return m_vram_addr_low & 0xff;
-}
-
-void wxstar4k_state::vidbd_sub_vram_counter_low_w(offs_t offset, uint8_t data)
-{
-	m_vram_addr_low = (m_vram_addr_low & 0xff00) | data;
-}
-
-uint8_t wxstar4k_state::vidbd_sub_vram_counter_high_r(offs_t offset)
-{
-	return (m_vram_addr_low >> 8) & 0xff;
-}
-
-void wxstar4k_state::vidbd_sub_vram_counter_high_w(offs_t offset, uint8_t data)
-{
-	m_vram_addr_low = (m_vram_addr_low & 0x00ff) | (uint16_t(data) << 8);
-}
-
-uint8_t wxstar4k_state::vidbd_sub_fifo_r()
-{
-	return m_gfx_sub_fifo_in;
-}
+uint8_t wxstar4k_state::vidbd_sub_vram_counter_low_r(offs_t offset) { return m_vram_addr_low & 0xff; }
+void wxstar4k_state::vidbd_sub_vram_counter_low_w(offs_t offset, uint8_t data) { m_vram_addr_low = (m_vram_addr_low & 0xff00) | data; }
+uint8_t wxstar4k_state::vidbd_sub_vram_counter_high_r(offs_t offset) { return (m_vram_addr_low >> 8) & 0xff; }
+void wxstar4k_state::vidbd_sub_vram_counter_high_w(offs_t offset, uint8_t data) { m_vram_addr_low = (m_vram_addr_low & 0x00ff) | (uint16_t(data) << 8); }
+uint8_t wxstar4k_state::vidbd_sub_fifo_r() { return m_gfx_sub_fifo_in; }
 
 void wxstar4k_state::vidbd_sub_map(address_map &map)
 {
@@ -405,9 +386,9 @@ void wxstar4k_state::vidbd_sub_io_map(address_map &map)
 	map(0x8800, 0x8800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(1); // Palette RW -> Offs 1
 	map(0x9000, 0x9000).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(2); // Mask RW -> Offs 2
 	map(0x9800, 0x9800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(0);    // Addr R -> Offs 0
-	map(0xa000, 0xa000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write)).select(4); // Overlay Addr W -> Offs 4 (writes main addr)
+	map(0xa000, 0xa000).mirror(0x4000).w(m_ramdac, FUNC(bt471_device::write)).select(4); // Overlay Addr W -> Offs 4
 	map(0xa800, 0xa800).mirror(0x4000).rw(m_ramdac, FUNC(bt471_device::read), FUNC(bt471_device::write)).select(5); // Overlay Data RW -> Offs 5
-	map(0xb800, 0xb800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(4);    // Overlay Addr R -> Offs 4 (reads main addr)
+	map(0xb800, 0xb800).mirror(0x4000).r(m_ramdac, FUNC(bt471_device::read)).select(4);    // Overlay Addr R -> Offs 4
 	map(0xc000, 0xffff).noprw();
 }
 
@@ -502,9 +483,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	NVRAM(config, "eeprom", nvram_device::DEFAULT_ALL_0);
 
 	ICM7170(config, m_rtc, XTAL(32'768));
-	// Fix: CORRECTED callback name based on icm7170.h: out_irq_cb()
-	m_rtc->irq().set(FUNC(wxstar4k_state::rtc_irq_w)); // <-- THIS LINE IS NOW CORRECTED
-	
+	m_rtc->irq().set(FUNC(wxstar4k_state::rtc_irq_w)); // Use correct irq() configuration function
+
 	/* Graphics board hardware */
 	M68010(config, m_gfxcpu, XTAL(20'000'000)/2);
 	m_gfxcpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::vidbd_main_map);
@@ -533,7 +513,7 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
 	m_screen->set_raw(XTAL(20'000'000) * 2 / 3, 858, 0, 640, 262, 0, 240);
 	m_screen->set_screen_update(FUNC(wxstar4k_state::screen_update));
-	m_screen->set_palette(m_palette);
+	m_screen->set_palette(m_palette); // Keep this, as screen_update now uses indexed bitmap
 
 	PALETTE(config, m_palette).set_entries(256); // 256 color entries
 

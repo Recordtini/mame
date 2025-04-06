@@ -22,7 +22,7 @@
 ***************************************************************************/
 
 #include "emu.h"
-#include "emu/driver.h" // Added to ensure driver_device is fully defined first
+// #include "emu/driver.h" // REMOVE THIS LINE
 #include "cpu/m68000/m68010.h"
 #include "cpu/mcs51/mcs51.h"
 #include "machine/gen_latch.h"
@@ -36,7 +36,7 @@
 #include "machine/6840ptm.h"
 #include "machine/i8251.h"
 #include "bus/rs232/rs232.h"
-#include "bus/pc_kbd/keyboards.h" // Correct path confirmed
+#include "bus/pc_kbd/keyboards.h" // Ensure this line uses the correct path
 
 #define LOG_CPU_IO (1U << 1)
 #define LOG_GFX_IO (1U << 2)
@@ -575,30 +575,30 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	m_datacpu->set_addrmap(AS_IO, &wxstar4k_state::databd_main_io_map);
 
 	/* I/O board hardware */
-	I8031(config, m_iocpu, XTAL(11'059'200));
-	m_iocpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::iobd_main_map);
-	m_iocpu->set_addrmap(AS_IO, &wxstar4k_state::iobd_main_io_map);
+    I8031(config, m_iocpu, XTAL(11'059'200));
+    m_iocpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::iobd_main_map);
+    m_iocpu->set_addrmap(AS_IO, &wxstar4k_state::iobd_main_io_map);
 
-	I8251(config, m_uart, XTAL(11'059'200)/6);
-	m_uart->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
-	m_uart->dtr_handler().set(m_rs232, FUNC(rs232_port_device::write_dtr));
-	m_uart->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
+    I8251(config, m_uart, XTAL(11'059'200)/6);
+    m_uart->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
+    m_uart->dtr_handler().set(m_rs232, FUNC(rs232_port_device::write_dtr));
+    m_uart->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
 
-	RS232_PORT(config, m_rs232, default_rs232_devices, nullptr);
-	m_rs232->rxd_handler().set(m_uart, FUNC(i8251_device::write_rxd));
-	m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
-	m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
+    RS232_PORT(config, m_rs232, default_rs232_devices, nullptr);
+    m_rs232->rxd_handler().set(m_uart, FUNC(i8251_device::write_rxd));
+    m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
+    m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
 
-	// Use the correct macro for AT Keyboard
-	AT_KEYBOARD(config, m_kbd, 0); // Removed type enum and clock div as they are handled internally by the device
-	m_kbd->keypress().set(FUNC(wxstar4k_state::kbd_put_key));
+    // Use the correct macro and tag for AT Keyboard
+    AT_KEYBOARD(config, KBD_TAG, 0); // Instantiate device with the tag used in the finder
+    m_kbd->keypress().set(FUNC(wxstar4k_state::kbd_put_key)); // Connect callback
 
-	/* Latches for Inter-CPU Communication */
-	GENERIC_LATCH_8(config, m_gfx_latch_in);
-	GENERIC_LATCH_8(config, m_data_latch_in);
-	GENERIC_LATCH_8(config, m_data_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::data_latch_irq_w));
-	GENERIC_LATCH_8(config, m_io_latch_in);
-	GENERIC_LATCH_8(config, m_io_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::io_latch_irq_w));
+    /* Latches for Inter-CPU Communication */
+    GENERIC_LATCH_8(config, m_gfx_latch_in);
+    GENERIC_LATCH_8(config, m_data_latch_in);
+    GENERIC_LATCH_8(config, m_data_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::data_latch_irq_w));
+    GENERIC_LATCH_8(config, m_io_latch_in);
+    GENERIC_LATCH_8(config, m_io_latch_out).data_pending_callback().set(FUNC(wxstar4k_state::io_latch_irq_w));
 
 	/* video hardware */
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);

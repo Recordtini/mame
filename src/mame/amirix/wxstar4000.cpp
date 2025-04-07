@@ -257,7 +257,17 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitm
 // --- CPU Board ---
 
 uint16_t wxstar4k_state::buserr_r() { LOGWARN("%s: Bus error read access!\n", machine().describe_context()); if (!machine().side_effects_disabled()) { m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE); m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE); } return 0xffff; }
-// void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask) { ... } // Definition removed/commented
+// Definition commented out as mapping is disabled for validation/debug
+// void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+// {
+//  if (ACCESSING_BITS_0_7) // Check the effective mask
+//  {
+//      uint8_t led_data = data & 0xff;
+//      LOGCPU("LED Write @ %08X: %02x\n", 0xfd1ffe | 1, led_data);
+//      for(int i=0; i<8; i++)
+//          m_diag_led[i] = BIT(led_data, i);
+//  }
+// }
 uint16_t wxstar4k_state::cpubd_watchdog_r() { LOGCPU("Read from Watchdog address @ FDF008\n"); return 0x0000; }
 void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask) { LOGCPU("Watchdog reset write: %04X & %04X\n", data, mem_mask); m_main_watchdog = 0; }
 void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_15 && offset == 0) { LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6 (Vector %02X?)\n", machine().describe_context(), m_gfx_irq_vector); m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector); } else { LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask); } }
@@ -381,11 +391,11 @@ void wxstar4k_state::iobd_main_io_map(address_map &map)
 
 // --- Machine Lifecycle ---
 
-void wxstar4k_state::driver_init()
-{
-	// Install TRAP #0 handler
-	m_maincpu->set_trap_handler(0, M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler));
-}
+// void wxstar4k_state::driver_init() // DELETE THIS ENTIRE FUNCTION
+// {
+//  // Install TRAP #0 handler
+//  m_maincpu->set_trap_handler(0, M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler));
+// }
 
 void wxstar4k_state::machine_start()
 {
@@ -433,37 +443,35 @@ void wxstar4k_state::kbd_put_key(u8 data) { LOGIO("Keyboard received scancode %0
 // Basic IRQ Acknowledge Handler
 IRQ_CALLBACK_MEMBER(wxstar4k_state::m68k_int_ack)
 {
-	int level = MC68K_INT_ACK_AUTOVECTOR; // Use correct constant
+	int level = -1; // Use -1 for autovector as a common value
 	switch(irqline)
 	{
-		case M68K_IRQ_1: level = MC68K_INT_ACK_AUTOVECTOR; LOGIRQ("ACK IRQ 1 (Auto)\n"); break;
+		case M68K_IRQ_1: level = -1; LOGIRQ("ACK IRQ 1 (Auto)\n"); break; // RTC is autovectored
 		case M68K_IRQ_2: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 2 (IO Latch - Vector %02X)\n", level); break;
-		case M68K_IRQ_3: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 3 (PTM? - Vector %02X)\n", level); break;
+		case M68K_IRQ_3: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 3 (PTM? - Vector %02X)\n", level); break; // Assume needs vector
 		case M68K_IRQ_4: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 4 (GFX - Vector %02X)\n", level); break;
 		case M68K_IRQ_5: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 5 (Data Latch - Vector %02X)\n", level); break;
-		case M68K_IRQ_6: level = MC68K_INT_ACK_AUTOVECTOR; LOGIRQ("ACK IRQ 6 (Unused? - Auto)\n"); break;
-		case M68K_IRQ_7: level = MC68K_INT_ACK_AUTOVECTOR; LOGIRQ("ACK IRQ 7 (AC Fail/NMI? - Auto)\n"); break;
+		case M68K_IRQ_6: level = -1; LOGIRQ("ACK IRQ 6 (Unused? - Auto)\n"); break; // Assume auto if unused
+		case M68K_IRQ_7: level = -1; LOGIRQ("ACK IRQ 7 (AC Fail/NMI? - Auto)\n"); break; // Assume NMI is autovectored if it uses IRQ7
 		default: LOGWARN("Unknown IRQ ACK: level %d\n", irqline); break;
 	}
+	// If vector is 0 or invalid, maybe default to auto? Check M68k behavior.
+	// For now, return what we determined. CPU core might handle spurious.
 	return level;
 }
 
 // Basic Trap #0 Handler
-M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler)
-{
-	// The actual trap code might be in D0 or passed some other way
-	uint16_t trap_code = m_maincpu->state_int(M68K_D0); // Common convention
-	LOGTRAP("TRAP #0 encountered! PC=%08X, Trap Code (D0) = %04X\n", m_maincpu->pc(), trap_code);
-
-	// Perform actions based on trap_code if known, otherwise just log
-	switch (trap_code)
-	{
-		// Add known trap codes here if discovered from ROM analysis
-		default:
-			LOGTRAP("  Unknown TRAP #0 code.\n");
-			break;
-	}
-}
+// M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler) // DELETE THIS BLOCK
+// {
+//  uint16_t trap_code = m_maincpu->state_int(M68K_D0);
+//  LOGTRAP("TRAP #0 encountered! PC=%08X, Trap Code (D0) = %04X\n", m_maincpu->pc(), trap_code);
+//  switch (trap_code)
+//  {
+//      default:
+//          LOGTRAP("  Unknown TRAP #0 code.\n");
+//          break;
+//  }
+// }
 
 static INPUT_PORTS_START( wxstar4k )
 	PORT_START(KBD_TAG)

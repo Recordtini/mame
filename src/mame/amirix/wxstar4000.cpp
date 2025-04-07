@@ -19,6 +19,8 @@
    - Verify Bt471 register mapping (pixel mask, overlay addr vs data)
    - Implement vector acknowledge handlers if needed
    - Refine 8031 keyboard interface (interrupts, status)
+   - Verify/Implement Trap #0 handler functionality
+   - Implement LED mapping correctly if needed for boot
 
 ***************************************************************************/
 
@@ -36,8 +38,7 @@
 #include "machine/6840ptm.h"
 #include "machine/i8251.h"
 #include "bus/rs232/rs232.h"
-//#include "bus/pc_kbd/keyboards.h" // Removed
-#include "machine/keyboard.h"     // Added for generic keyboard
+#include "machine/keyboard.h" // Use generic keyboard
 
 #define LOG_CPU_IO (1U << 1)
 #define LOG_GFX_IO (1U << 2)
@@ -47,9 +48,10 @@
 #define LOG_IRQ (1U << 6)
 #define LOG_WARN (1U << 7)
 #define LOG_LATCH (1U << 8)
+#define LOG_TRAP (1U << 9) // Added for TRAP #0 logging
 
-//#define VERBOSE (LOG_CPU_IO | LOG_GFX_IO | LOG_GFX_SUB_IO | LOG_DATA_IO | LOG_IO_IO | LOG_IRQ | LOG_WARN | LOG_LATCH)
-#define VERBOSE (LOG_WARN | LOG_IRQ | LOG_LATCH | LOG_IO_IO) // Added IO Log
+//#define VERBOSE (LOG_CPU_IO | LOG_GFX_IO | LOG_GFX_SUB_IO | LOG_DATA_IO | LOG_IO_IO | LOG_IRQ | LOG_WARN | LOG_LATCH | LOG_TRAP)
+#define VERBOSE (LOG_WARN | LOG_IRQ | LOG_LATCH | LOG_IO_IO | LOG_TRAP) // Added IO Log & Trap Log
 #include "logmacro.h"
 
 #define LOGCPU(x, ...)    LOGMASKED(LOG_CPU_IO, x, ##__VA_ARGS__)
@@ -60,17 +62,19 @@
 #define LOGIRQ(x, ...)    LOGMASKED(LOG_IRQ, x, ##__VA_ARGS__)
 #define LOGWARN(x, ...)   LOGMASKED(LOG_WARN, x, ##__VA_ARGS__)
 #define LOGLATCH(x, ...)  LOGMASKED(LOG_LATCH, x, ##__VA_ARGS__)
+#define LOGTRAP(x, ...)   LOGMASKED(LOG_TRAP, x, ##__VA_ARGS__)
 
 // Device Tags
 #define PTM_TAG "u51_ptm"
 #define UART_TAG "u5_uart"
-#define KBD_TAG "kbd" // Keep tag for generic keyboard
+#define KBD_TAG "kbd"
 #define RS232_TAG "serport"
-#define GFX_LATCH_IN_TAG "gfxlatch_in"
-#define DATA_LATCH_IN_TAG "datalatch_in"
-#define DATA_LATCH_OUT_TAG "datalatch_out"
-#define IO_LATCH_IN_TAG "iolatch_in"
-#define IO_LATCH_OUT_TAG "iolatch_out"
+#define GFX_LATCH_IN_TAG "gfxlatch_in" // 68k -> 8051
+// #define GFX_LATCH_OUT_TAG "gfxlatch_out" // 8051 -> 68k (Needed? Not obvious from disasm)
+#define DATA_LATCH_IN_TAG "datalatch_in" // 68k -> 8344
+#define DATA_LATCH_OUT_TAG "datalatch_out" // 8344 -> 68k
+#define IO_LATCH_IN_TAG "iolatch_in"    // 68k -> 8031
+#define IO_LATCH_OUT_TAG "iolatch_out"  // 8031 -> 68k
 
 
 namespace {
@@ -96,13 +100,13 @@ public:
 		m_ptm(*this, PTM_TAG),
 		m_uart(*this, UART_TAG),
 		m_rs232(*this, RS232_TAG),
-		// m_kbd(*this, KBD_TAG), // Removed finder for keyboard device
+		// Keyboard device is instantiated in machine_config, not found directly here
 		m_gfx_latch_in(*this, GFX_LATCH_IN_TAG),
 		m_data_latch_in(*this, DATA_LATCH_IN_TAG),
 		m_data_latch_out(*this, DATA_LATCH_OUT_TAG),
 		m_io_latch_in(*this, IO_LATCH_IN_TAG),
 		m_io_latch_out(*this, IO_LATCH_OUT_TAG),
-		m_diag_led(*this, "led%u", 0U), // This initializer format is correct
+		m_diag_led(*this, "led%u", 0U),
 		m_cpu_irq_vector(0),
 		m_gfx_irq_vector(0),
 		m_gfx_sub_p1(0xff),
@@ -130,6 +134,7 @@ private:
 	// Driver overrides
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
+	virtual void driver_init() override ATTR_COLD; // Added for trap handler
 
 	// Devices
 	required_device<m68010_device> m_maincpu;
@@ -148,7 +153,7 @@ private:
 	required_device<ptm6840_device> m_ptm;
 	required_device<i8251_device> m_uart;
 	required_device<rs232_port_device> m_rs232;
-	// required_device<at_keyboard_device> m_kbd; // Removed
+	// Keyboard device handled via generic_keyboard_device in machine_config
 	required_device<generic_latch_8_device> m_gfx_latch_in;
 	required_device<generic_latch_8_device> m_data_latch_in;
 	required_device<generic_latch_8_device> m_data_latch_out;
@@ -174,6 +179,7 @@ private:
 	uint16_t cpubd_data_latch_r();
 	void cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 	void cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
+	uint16_t cpubd_watchdog_r(); // Added for readback observed in disassembly
 	void cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 
 	// Graphics Board 68010 I/O Handlers
@@ -216,9 +222,10 @@ private:
 	void ptm_irq_w(int state);
 	void data_latch_irq_w(int state);
 	void io_latch_irq_w(int state);
-	// Signature change for generic keyboard
 	void kbd_put_key(u8 data);
     void led_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
+	IRQ_CALLBACK_MEMBER(m68k_int_ack); // Added for vector ack
+	M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler); // Added for TRAP #0
 };
 
 // --- Video ---
@@ -253,18 +260,37 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitm
 // --- CPU Board ---
 
 uint16_t wxstar4k_state::buserr_r() { LOGWARN("%s: Bus error read access!\n", machine().describe_context()); if (!machine().side_effects_disabled()) { m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE); m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE); } return 0xffff; }
-void wxstar4k_state::led_w(uint8_t data)
+
+void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	LOGCPU("LED Write: %02x (Handler called, but mapping commented out)\n", data);
-	for(int i=0; i<8; i++)
-		m_diag_led[i] = BIT(data, i);
+	if (ACCESSING_BITS_0_7)
+	{
+		uint8_t led_data = data & 0xff;
+		LOGCPU("LED Write @ %08X: %02x (Handler defined but mapping commented out)\n", 0xfd1ffe | 1, led_data);
+		for(int i=0; i<8; i++)
+			m_diag_led[i] = BIT(led_data, i);
+	}
+}
+
+// Add read handler for watchdog register
+uint16_t wxstar4k_state::cpubd_watchdog_r()
+{
+	LOGCPU("Read from Watchdog address @ FDF008\n");
+	// What should it return? Let's return 0 for now.
+	return 0x0000;
 }
 void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask) { LOGCPU("Watchdog reset write: %04X & %04X\n", data, mem_mask); m_main_watchdog = 0; }
-void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_15 && offset == 0) { LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6\n", machine().describe_context()); m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector); } else { LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask); } }
+
+void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_15 && offset == 0) { LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6 (Vector %02X?)\n", machine().describe_context(), m_gfx_irq_vector); m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector); } else { LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask); } }
 uint16_t wxstar4k_state::cpubd_io_status_r() { uint16_t status = m_io_latch_out->pending_r() ? 1 : 0; LOGCPU("%s: Read from I/O card status @ C00000 = %04X\n", machine().describe_context(), status); return status; }
 void wxstar4k_state::cpubd_io_control_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { LOGLATCH("Write to I/O card control/data @ C00000: data %02X -> Latch In\n", data & 0xff); m_io_latch_in->write(data & 0xff); } }
+
+// Map confirmed address C0A400 for reading Data Latch Out
 uint16_t wxstar4k_state::cpubd_data_latch_r() { uint16_t data = m_data_latch_out->read(); LOGLATCH("%s: Read byte from Data card latch @ C0A400 = %02X\n", machine().describe_context(), data & 0xff); return data; }
+
+// Map confirmed addresses C0A000 and C0A200 for writing Data Latch In
 void wxstar4k_state::cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { uint8_t byte_data = data & 0xff; if (offset == 0 || offset == 0x100) { LOGLATCH("Write byte to Data card latch @ %08X: data %02X\n", 0xC0A000 + (offset*2), byte_data); m_data_latch_in->write(byte_data); } else if (offset == 0x300) { LOGCPU("Write byte to audio control latch 1 @ C0A600: data %02X\n", byte_data); } else if (offset == 0x400) { LOGCPU("Write byte to audio control latch 2 @ C0A800: data %02X\n", byte_data); } } else { LOGCPU("Write to Data card area offset %X: data %04X & %04X\n", offset*2, data, mem_mask); } }
+
 
 void wxstar4k_state::cpubd_main_map(address_map &map)
 {
@@ -278,16 +304,20 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 	map(0xc04000, 0xc041ff).noprw(); // I/O card modem buffer?
 
 	// --- Data Card Access ---
-	map(0xc0a000, 0xc0a801).rw(FUNC(wxstar4k_state::cpubd_data_latch_r), FUNC(wxstar4k_state::cpubd_data_latch_w)); // Data latches/Audio control
+	// C0A000 = Write Data Latch In
+	// C0A200 = Write Data Latch In
+	// C0A400 = Read Data Latch Out
+	// C0A600 = Write Audio Latch 1
+	// C0A800 = Write Audio Latch 2
+	map(0xc0a000, 0xc0a801).rw(FUNC(wxstar4k_state::cpubd_data_latch_r), FUNC(wxstar4k_state::cpubd_data_latch_w));
 
 	map(0xc0a802, 0xfcffff).r(FUNC(wxstar4k_state::buserr_r)); // Unmapped?
 
 	// --- On-board Peripherals ---
 	map(0xfd0000, 0xfd1fff).ram().share("eeprom"); // EEPROM
 
-	// Commented out the LED write mapping to bypass validation error for now
-	// map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).select(1); // Diagnostic LEDs - Caused validation error
-	// map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).umask16(0x00ff); // Diagnostic LEDs - Also caused validation error
+	// LED mapping remains commented out for debugging validation/boot issues
+	// map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).umask16(0x00ff); // Diagnostic LEDs
 
 	map(0xfd8000, 0xfd800f).rw(m_ptm, FUNC(ptm6840_device::read), FUNC(ptm6840_device::write)).umask16(0x00ff); // PTM @ Guessed addr
 
@@ -295,7 +325,7 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 	// FDF004 - cause IRQ 6 on graphics card 2 (not used)
 	map(0xfdf000, 0xfdf007).w(FUNC(wxstar4k_state::cpubd_gfx_irq6_w));
 	// FDF008 - reset watchdog
-	map(0xfdf008, 0xfdf009).w(FUNC(wxstar4k_state::cpubd_watchdog_reset_w));
+	map(0xfdf008, 0xfdf009).rw(FUNC(wxstar4k_state::cpubd_watchdog_r), FUNC(wxstar4k_state::cpubd_watchdog_reset_w)); // Add read handler
 
 	// FDF00A - FDFFBF - Unused?
 	map(0xfdf00a, 0xfdffbf).r(FUNC(wxstar4k_state::buserr_r));
@@ -339,6 +369,7 @@ uint8_t wxstar4k_state::vidbd_sub_vram_counter_low_r(offs_t offset) { return m_v
 void wxstar4k_state::vidbd_sub_vram_counter_low_w(offs_t offset, uint8_t data) { m_vram_addr_low = (m_vram_addr_low & 0xff00) | data; }
 uint8_t wxstar4k_state::vidbd_sub_vram_counter_high_r(offs_t offset) { return (m_vram_addr_low >> 8) & 0xff; }
 void wxstar4k_state::vidbd_sub_vram_counter_high_w(offs_t offset, uint8_t data) { m_vram_addr_low = (m_vram_addr_low & 0x00ff) | (uint16_t(data) << 8); }
+// Map confirmed address 2000-27FF for reading GFX Latch In
 uint8_t wxstar4k_state::vidbd_sub_latch_r() { uint8_t data = m_gfx_latch_in->read(); LOGLATCH("%s: GFX 8051 reads latch from 68010 = %02X\n", machine().describe_context(), data); return data; }
 
 void wxstar4k_state::vidbd_sub_map(address_map &map) { map(0x0000, 0x1fff).rom().region("gfxsubcpu", 0); }
@@ -367,58 +398,16 @@ void wxstar4k_state::vidbd_sub_p3_w(uint8_t data) { }
 
 uint8_t wxstar4k_state::databd_latch_in_r() { uint8_t data = m_data_latch_in->read(); LOGLATCH("Data 8344 reads latch from main CPU = %02X\n", data); return data; }
 void wxstar4k_state::databd_latch_out_w(uint8_t data) { LOGLATCH("Data 8344 writes latch to main CPU = %02X\n", data); m_data_latch_out->write(data); }
-uint8_t wxstar4k_state::databd_pio1_r(offs_t offset)
-{
-	switch(offset) {
-		case 0: LOGDATA("Read PIO1 Command/Status\n"); break;
-		case 1: LOGDATA("Read PIO1 Port A (VME Addr/Data?)\n"); break;
-		case 2: LOGDATA("Read PIO1 Port B (Rear Switches?)\n"); /* TODO: return m_rear_switches->read(); */ break;
-		case 3: LOGDATA("Read PIO1 Port C\n"); break;
-		case 4: LOGDATA("Read PIO1 Transfer Count Low\n"); break;
-		case 5: LOGDATA("Read PIO1 Transfer Count High\n"); break;
-	}
-	return 0;
-}
-void wxstar4k_state::databd_pio1_w(offs_t offset, uint8_t data)
-{
-	switch(offset) {
-		case 0: LOGDATA("Write PIO1 Command/Status = %02X\n", data); break;
-		case 1: LOGDATA("Write PIO1 Port A (VME Addr/Data?) = %02X\n", data); break;
-		case 2: LOGDATA("Write PIO1 Port B (Rear Switches?) = %02X\n", data); break;
-		case 3: LOGDATA("Write PIO1 Port C = %02X\n", data); break;
-		case 4: LOGDATA("Write PIO1 Transfer Count Low = %02X\n", data); break;
-		case 5: LOGDATA("Write PIO1 Transfer Count High = %02X\n", data); break;
-	}
-}
-uint8_t wxstar4k_state::databd_pio2_r(offs_t offset)
-{
-	switch(offset) {
-		case 0: LOGDATA("Read PIO2 Command/Status\n"); break;
-		case 1: LOGDATA("Read PIO2 Port A (LEDs?)\n"); break;
-		case 2: LOGDATA("Read PIO2 Port B (DTMF/LED?)\n"); break;
-		case 3: LOGDATA("Read PIO2 Port C (Indicators?)\n"); break;
-		case 4: LOGDATA("Read PIO2 Transfer Count Low\n"); break;
-		case 5: LOGDATA("Read PIO2 Transfer Count High\n"); break;
-	}
-	return 0;
-}
-void wxstar4k_state::databd_pio2_w(offs_t offset, uint8_t data)
-{
-	switch(offset) {
-		case 0: LOGDATA("Write PIO2 Command/Status = %02X\n", data); break;
-		case 1: LOGDATA("Write PIO2 Port A (Indicator LEDs) = %02X\n", data); /* TODO: Update LEDs */ break;
-		case 2: LOGDATA("Write PIO2 Port B (DTMF dialer + LED) = %02X\n", data); /* TODO: Update DTMF/LED */ break;
-		case 3: LOGDATA("Write PIO2 Port C (bus clear, charging indicator) = %02X\n", data); /* TODO: Update indicators */ break;
-		case 4: LOGDATA("Write PIO2 Transfer Count Low = %02X\n", data); break;
-		case 5: LOGDATA("Write PIO2 Transfer Count High = %02X\n", data); break;
-	}
-}
+uint8_t wxstar4k_state::databd_pio1_r(offs_t offset) { switch(offset) { case 0: LOGDATA("Read PIO1 Cmd/Status\n"); break; case 1: LOGDATA("Read PIO1 Port A (VME Addr/Data?)\n"); break; case 2: LOGDATA("Read PIO1 Port B (Rear Switches?)\n"); break; case 3: LOGDATA("Read PIO1 Port C\n"); break; case 4: LOGDATA("Read PIO1 Xfer Cnt Low\n"); break; case 5: LOGDATA("Read PIO1 Xfer Cnt High\n"); break; } return 0; }
+void wxstar4k_state::databd_pio1_w(offs_t offset, uint8_t data) { switch(offset) { case 0: LOGDATA("Write PIO1 Cmd/Status = %02X\n", data); break; case 1: LOGDATA("Write PIO1 Port A (VME Addr/Data?) = %02X\n", data); break; case 2: LOGDATA("Write PIO1 Port B = %02X\n", data); break; case 3: LOGDATA("Write PIO1 Port C = %02X\n", data); break; case 4: LOGDATA("Write PIO1 Xfer Cnt Low = %02X\n", data); break; case 5: LOGDATA("Write PIO1 Xfer Cnt High = %02X\n", data); break; } }
+uint8_t wxstar4k_state::databd_pio2_r(offs_t offset) { switch(offset) { case 0: LOGDATA("Read PIO2 Cmd/Status\n"); break; case 1: LOGDATA("Read PIO2 Port A (LEDs?)\n"); break; case 2: LOGDATA("Read PIO2 Port B (DTMF/LED?)\n"); break; case 3: LOGDATA("Read PIO2 Port C (Indicators?)\n"); break; case 4: LOGDATA("Read PIO2 Xfer Cnt Low\n"); break; case 5: LOGDATA("Read PIO2 Xfer Cnt High\n"); break; } return 0; }
+void wxstar4k_state::databd_pio2_w(offs_t offset, uint8_t data) { switch(offset) { case 0: LOGDATA("Write PIO2 Cmd/Status = %02X\n", data); break; case 1: LOGDATA("Write PIO2 Port A (LEDs) = %02X\n", data); break; case 2: LOGDATA("Write PIO2 Port B (DTMF/LED) = %02X\n", data); break; case 3: LOGDATA("Write PIO2 Port C (Indicators) = %02X\n", data); break; case 4: LOGDATA("Write PIO2 Xfer Cnt Low = %02X\n", data); break; case 5: LOGDATA("Write PIO2 Xfer Cnt High = %02X\n", data); break; } }
 
 void wxstar4k_state::databd_main_map(address_map &map) { map(0x0000, 0x1fff).rom().region("datacpu", 0); }
 void wxstar4k_state::databd_main_io_map(address_map &map)
 {
 	map(0x0000, 0x01ff).ram();
-	map(0x0200, 0x0201).noprw(); // UART
+	map(0x0200, 0x0201).noprw(); // Internal 8344 UART?
 	map(0x2000, 0x2000).r(FUNC(wxstar4k_state::databd_latch_in_r)); // Guessed addr
 	map(0x2001, 0x2001).w(FUNC(wxstar4k_state::databd_latch_out_w)); // Guessed addr
 	map(0x8000, 0x8005).rw(FUNC(wxstar4k_state::databd_pio1_r), FUNC(wxstar4k_state::databd_pio1_w)); // PIO1
@@ -445,6 +434,12 @@ void wxstar4k_state::iobd_main_io_map(address_map &map)
 
 // --- Machine Lifecycle ---
 
+void wxstar4k_state::driver_init()
+{
+	// Install TRAP #0 handler
+	m_maincpu->set_trap_handler(0, M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler));
+}
+
 void wxstar4k_state::machine_start()
 {
 	m_diag_led.resolve();
@@ -459,16 +454,11 @@ void wxstar4k_state::machine_start()
 	m_nvram->set_base(memshare("eeprom")->ptr(), 0x2000);
 }
 
-// Use memcpy for cleaner reset vector copy
 void wxstar4k_state::machine_reset()
 {
-	// Copy reset vector using memcpy
 	uint16_t *ram = m_mainram.target();
-	// Get base pointer and cast
 	uint16_t *rom = (uint16_t *)memregion("maincpu")->base();
-	memcpy(ram, rom, 8); // Copy SP (4 bytes) + PC (4 bytes) = 8 bytes
-
-	// Reset internal state
+	memcpy(ram, rom, 8); // Copy SP (4 bytes) + PC (4 bytes)
 	m_cpu_irq_vector = 0;
 	m_gfx_irq_vector = 0;
 	m_main_watchdog = 0;
@@ -477,15 +467,16 @@ void wxstar4k_state::machine_reset()
 	m_gfx_sub_p1 = 0xff;
 	m_io_kbd_data = 0;
 	m_io_kbd_status = 0;
-
-	// Reset sub-CPUs
 	m_gfxcpu->reset();
 	m_gfxsubcpu->reset();
 	m_datacpu->reset();
 	m_iocpu->reset();
+
+	// Set VBR to ROM initially
+	m_maincpu->set_vbr(0xfe0000);
 }
 
-// --- Interrupt Handling ---
+// --- Interrupt Handling & Callbacks ---
 
 TIMER_DEVICE_CALLBACK_MEMBER(wxstar4k_state::vblank_irq)
 {
@@ -493,38 +484,54 @@ TIMER_DEVICE_CALLBACK_MEMBER(wxstar4k_state::vblank_irq)
 	m_gfxcpu->set_input_line(M68K_IRQ_5, CLEAR_LINE);
 	m_gfxsubcpu->set_input_line(MCS51_INT0_LINE, ASSERT_LINE);
 }
-void wxstar4k_state::rtc_irq_w(int state)
+void wxstar4k_state::rtc_irq_w(int state) { LOGIRQ("RTC IRQ -> Main CPU IRQ 1 %s\n", state ? "Assert" : "Clear"); m_maincpu->set_input_line(M68K_IRQ_1, state ? ASSERT_LINE : CLEAR_LINE); }
+void wxstar4k_state::ptm_irq_w(int state) { LOGIRQ("PTM IRQ -> Main CPU IRQ 3 %s\n", state ? "Assert" : "Clear"); m_maincpu->set_input_line_and_vector(M68K_IRQ_3, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector); }
+void wxstar4k_state::data_latch_irq_w(int state) { LOGIRQ("Data Latch IRQ -> Main CPU IRQ 5 %s\n", state ? "Assert" : "Clear"); m_maincpu->set_input_line_and_vector(M68K_IRQ_5, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector); }
+void wxstar4k_state::io_latch_irq_w(int state) { LOGIRQ("I/O Latch IRQ -> Main CPU IRQ 2 %s\n", state ? "Assert" : "Clear"); m_maincpu->set_input_line_and_vector(M68K_IRQ_2, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector); }
+void wxstar4k_state::kbd_put_key(u8 data) { LOGIO("Keyboard received scancode %02X\n", data); m_io_kbd_data = data; m_io_kbd_status |= 1; }
+
+// Basic IRQ Acknowledge Handler (returns vector if known, else autovector)
+IRQ_CALLBACK_MEMBER(wxstar4k_state::m68k_int_ack)
 {
-	LOGIRQ("RTC IRQ -> Main CPU IRQ 1 %s\n", state ? "Assert" : "Clear");
-	m_maincpu->set_input_line(M68K_IRQ_1, state ? ASSERT_LINE : CLEAR_LINE);
+	int level = M68K_INT_AUTOVECTOR; // Default to autovector
+	switch(irqline)
+	{
+		case M68K_IRQ_1: level = M68K_INT_AUTOVECTOR; LOGIRQ("ACK IRQ 1 (Auto)\n"); break; // RTC is autovectored
+		case M68K_IRQ_2: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 2 (IO Latch - Vector %02X)\n", level); break;
+		case M68K_IRQ_3: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 3 (PTM? - Vector %02X)\n", level); break; // Assume needs vector
+		case M68K_IRQ_4: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 4 (GFX - Vector %02X)\n", level); break;
+		case M68K_IRQ_5: level = m_cpu_irq_vector; LOGIRQ("ACK IRQ 5 (Data Latch - Vector %02X)\n", level); break;
+		case M68K_IRQ_6: level = M68K_INT_AUTOVECTOR; LOGIRQ("ACK IRQ 6 (Unused? - Auto)\n"); break;
+		case M68K_IRQ_7: level = M68K_INT_AUTOVECTOR; LOGIRQ("ACK IRQ 7 (AC Fail/NMI? - Auto)\n"); break; // Assume NMI is autovectored if it uses IRQ7
+		default: LOGWARN("Unknown IRQ ACK: level %d\n", irqline); break;
+	}
+
+	// Clear the line now that it's acknowledged (may need adjustment)
+	// m_maincpu->set_input_line(irqline, CLEAR_LINE); // Disabled for now, let handlers clear
+
+	return level;
 }
-void wxstar4k_state::ptm_irq_w(int state)
+
+// Basic Trap #0 Handler
+M68K_TRAP_HANDLER_CB_MEMBER(trap0_handler)
 {
-	LOGIRQ("PTM IRQ -> Main CPU IRQ 3 %s\n", state ? "Assert" : "Clear");
-	m_maincpu->set_input_line_and_vector(M68K_IRQ_3, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector); // Assuming vector needed
-}
-void wxstar4k_state::data_latch_irq_w(int state)
-{
-	LOGIRQ("Data Latch IRQ -> Main CPU IRQ 5 %s\n", state ? "Assert" : "Clear");
-	m_maincpu->set_input_line_and_vector(M68K_IRQ_5, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
-}
-void wxstar4k_state::io_latch_irq_w(int state)
-{
-	LOGIRQ("I/O Latch IRQ -> Main CPU IRQ 2 %s\n", state ? "Assert" : "Clear");
-	m_maincpu->set_input_line_and_vector(M68K_IRQ_2, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
-}
-// Correct signature for generic_keyboard_device callback
-void wxstar4k_state::kbd_put_key(u8 data)
-{
-	LOGIO("Keyboard received scancode %02X\n", data);
-	m_io_kbd_data = data;
-	m_io_kbd_status |= 1;
-	// TODO: Assert 8031 interrupt?
+	// The actual trap code might be in D0 or passed some other way
+	uint16_t trap_code = m_maincpu->state_int(M68K_D0); // Common convention
+	LOGTRAP("TRAP #0 encountered! PC=%08X, Trap Code (D0) = %04X\n", m_maincpu->pc(), trap_code);
+
+	// Perform actions based on trap_code if known, otherwise just log
+	switch (trap_code)
+	{
+		// Add known trap codes here if discovered from ROM analysis
+		default:
+			LOGTRAP("  Unknown TRAP #0 code.\n");
+			break;
+	}
 }
 
 static INPUT_PORTS_START( wxstar4k )
-	PORT_START(KBD_TAG) // Use KBD_TAG here
-	PORT_INCLUDE(generic_keyboard) // Use generic keyboard include
+	PORT_START(KBD_TAG)
+	PORT_INCLUDE(generic_keyboard)
 INPUT_PORTS_END
 
 
@@ -535,6 +542,7 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	/* basic machine hardware */
 	M68010(config, m_maincpu, XTAL(20'000'000)/2);
 	m_maincpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::cpubd_main_map);
+	m_maincpu->set_irq_acknowledge_callback(FUNC(wxstar4k_state::m68k_int_ack)); // Add IRQ ack handler
 
 	NVRAM(config, "eeprom", nvram_device::DEFAULT_ALL_0);
 
@@ -548,6 +556,8 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	/* Graphics board hardware */
 	M68010(config, m_gfxcpu, XTAL(20'000'000)/2);
 	m_gfxcpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::vidbd_main_map);
+	// GFX CPU IRQ acknowledge? Needed for IRQ6?
+	// m_gfxcpu->set_irq_acknowledge_callback(...)
 
 	I8051(config, m_gfxsubcpu, XTAL(12'000'000));
 	m_gfxsubcpu->set_addrmap(AS_PROGRAM, &wxstar4k_state::vidbd_sub_map);
@@ -579,7 +589,6 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
 	m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
 
-	// Use generic keyboard device
 	GENERIC_KEYBOARD(config, KBD_TAG, 0);
 	subdevice<generic_keyboard_device>(KBD_TAG)->set_keyboard_callback(FUNC(wxstar4k_state::kbd_put_key));
 

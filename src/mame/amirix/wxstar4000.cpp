@@ -25,7 +25,7 @@
 
 #include "emu.h"
 #include "cpu/m68000/m68010.h"
-#include "cpu/m68000/m68k.h" // Added for MC68K_INT_ACK_AUTOVECTOR
+#include "devices/cpu/m68000/m68000.h"
 #include "cpu/mcs51/mcs51.h"
 #include "machine/gen_latch.h"
 #include "machine/icm7170.h"

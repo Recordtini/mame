@@ -218,7 +218,7 @@ private:
 	void io_latch_irq_w(int state);
 	// Signature change for generic keyboard
 	void kbd_put_key(u8 data);
-	void led_w(uint8_t data);
+    void led_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 };
 
 // --- Video ---
@@ -253,7 +253,22 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitm
 // --- CPU Board ---
 
 uint16_t wxstar4k_state::buserr_r() { LOGWARN("%s: Bus error read access!\n", machine().describe_context()); if (!machine().side_effects_disabled()) { m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE); m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE); } return 0xffff; }
-void wxstar4k_state::led_w(uint8_t data) { LOGCPU("LED Write: %02x\n", data); for(int i=0; i<8; i++) m_diag_led[i] = BIT(data, i); }
+void wxstar4k_state::led_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+{
+	// This handler is called when a write occurs to 0xFD1FFE-FD1FFF.
+	// The umask16(0x00ff) in the map ensures mem_mask only allows the low byte.
+	// 'data' will contain the full 16-bit value attempted by the CPU,
+	// but we only care about the low byte if mem_mask allows it.
+
+	if (ACCESSING_BITS_0_7) // Check the effective mask
+	{
+		uint8_t led_data = data & 0xff;
+		// Use offset 1 explicitly since we know umask16 selects the low byte @ odd addr
+		LOGCPU("LED Write @ %08X: %02x\n", 0xfd1ffe | 1, led_data);
+		for(int i=0; i<8; i++)
+			m_diag_led[i] = BIT(led_data, i);
+	}
+}
 void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask) { LOGCPU("Watchdog reset write: %04X & %04X\n", data, mem_mask); m_main_watchdog = 0; }
 void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_15 && offset == 0) { LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6\n", machine().describe_context()); m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector); } else { LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask); } }
 uint16_t wxstar4k_state::cpubd_io_status_r() { uint16_t status = m_io_latch_out->pending_r() ? 1 : 0; LOGCPU("%s: Read from I/O card status @ C00000 = %04X\n", machine().describe_context(), status); return status; }
@@ -271,9 +286,12 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 	map(0xc04000, 0xc041ff).noprw();
 	map(0xc0a000, 0xc0a801).rw(FUNC(wxstar4k_state::cpubd_data_latch_r), FUNC(wxstar4k_state::cpubd_data_latch_w));
 	map(0xc0a802, 0xfcffff).r(FUNC(wxstar4k_state::buserr_r));
-	map(0xfd0000, 0xfd1fff).ram().share("eeprom");
-	map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).select(1); // Use select(1) for low byte
-	map(0xfd8000, 0xfd800f).rw(m_ptm, FUNC(ptm6840_device::read), FUNC(ptm6840_device::write)).umask16(0x00ff);
+    map(0xfd0000, 0xfd1fff).ram().share("eeprom"); // EEPROM
+
+    // Reverted mapping: map the word address, mask to low byte
+    map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).umask16(0x00ff); // Diagnostic LEDs
+
+    map(0xfd8000, 0xfd800f).rw(m_ptm, FUNC(ptm6840_device::read), FUNC(ptm6840_device::write)).umask16(0x00ff); // PTM @ Guessed addr
 	map(0xfdf000, 0xfdf007).w(FUNC(wxstar4k_state::cpubd_gfx_irq6_w));
 	map(0xfdf008, 0xfdf009).w(FUNC(wxstar4k_state::cpubd_watchdog_reset_w));
 	map(0xfdf00a, 0xfdffbf).r(FUNC(wxstar4k_state::buserr_r));

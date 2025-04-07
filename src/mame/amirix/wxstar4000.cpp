@@ -18,11 +18,11 @@
    - Verify screen parameters and VRAM mapping
    - Verify Bt471 register mapping (pixel mask, overlay addr vs data)
    - Implement vector acknowledge handlers if needed
+   - Refine 8031 keyboard interface (interrupts, status)
 
 ***************************************************************************/
 
 #include "emu.h"
-// #include "emu/driver.h" // Removed - unnecessary
 #include "cpu/m68000/m68010.h"
 #include "cpu/mcs51/mcs51.h"
 #include "machine/gen_latch.h"
@@ -36,7 +36,8 @@
 #include "machine/6840ptm.h"
 #include "machine/i8251.h"
 #include "bus/rs232/rs232.h"
-#include "bus/pc_kbd/keyboards.h" // Correct path confirmed
+//#include "bus/pc_kbd/keyboards.h" // Removed
+#include "machine/keyboard.h"     // Added for generic keyboard
 
 #define LOG_CPU_IO (1U << 1)
 #define LOG_GFX_IO (1U << 2)
@@ -48,7 +49,7 @@
 #define LOG_LATCH (1U << 8)
 
 //#define VERBOSE (LOG_CPU_IO | LOG_GFX_IO | LOG_GFX_SUB_IO | LOG_DATA_IO | LOG_IO_IO | LOG_IRQ | LOG_WARN | LOG_LATCH)
-#define VERBOSE (LOG_WARN | LOG_IRQ | LOG_LATCH)
+#define VERBOSE (LOG_WARN | LOG_IRQ | LOG_LATCH | LOG_IO_IO) // Added IO Log
 #include "logmacro.h"
 
 #define LOGCPU(x, ...)    LOGMASKED(LOG_CPU_IO, x, ##__VA_ARGS__)
@@ -63,7 +64,7 @@
 // Device Tags
 #define PTM_TAG "u51_ptm"
 #define UART_TAG "u5_uart"
-#define KBD_TAG "kbd"
+#define KBD_TAG "kbd" // Keep tag for generic keyboard
 #define RS232_TAG "serport"
 #define GFX_LATCH_IN_TAG "gfxlatch_in"
 #define DATA_LATCH_IN_TAG "datalatch_in"
@@ -95,13 +96,13 @@ public:
 		m_ptm(*this, PTM_TAG),
 		m_uart(*this, UART_TAG),
 		m_rs232(*this, RS232_TAG),
-		m_kbd(*this, KBD_TAG),
+		// m_kbd(*this, KBD_TAG), // Removed finder for keyboard device
 		m_gfx_latch_in(*this, GFX_LATCH_IN_TAG),
 		m_data_latch_in(*this, DATA_LATCH_IN_TAG),
 		m_data_latch_out(*this, DATA_LATCH_OUT_TAG),
 		m_io_latch_in(*this, IO_LATCH_IN_TAG),
 		m_io_latch_out(*this, IO_LATCH_OUT_TAG),
-		m_diag_led(*this, "led%u", 0U),
+		m_diag_led(*this, "led%u", 0U), // This initializer format is correct
 		m_cpu_irq_vector(0),
 		m_gfx_irq_vector(0),
 		m_gfx_sub_p1(0xff),
@@ -147,7 +148,7 @@ private:
 	required_device<ptm6840_device> m_ptm;
 	required_device<i8251_device> m_uart;
 	required_device<rs232_port_device> m_rs232;
-	required_device<at_keyboard_device> m_kbd;
+	// required_device<at_keyboard_device> m_kbd; // Removed
 	required_device<generic_latch_8_device> m_gfx_latch_in;
 	required_device<generic_latch_8_device> m_data_latch_in;
 	required_device<generic_latch_8_device> m_data_latch_out;
@@ -215,8 +216,8 @@ private:
 	void ptm_irq_w(int state);
 	void data_latch_irq_w(int state);
 	void io_latch_irq_w(int state);
-	void kbd_put_key(uint8_t scancode);
-	// Changed LED handler signature
+	// Signature change for generic keyboard
+	void kbd_put_key(u8 data);
 	void led_w(uint8_t data);
 };
 
@@ -251,35 +252,14 @@ uint32_t wxstar4k_state::screen_update(screen_device &screen, bitmap_ind16 &bitm
 
 // --- CPU Board ---
 
-uint16_t wxstar4k_state::buserr_r()
-{
-	LOGWARN("%s: Bus error read access!\n", machine().describe_context());
-	if (!machine().side_effects_disabled())
-	{
-		m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
-		m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
-	}
-	return 0xffff;
-}
-
-// Corrected handler signature and implementation for .select(1)
-void wxstar4k_state::led_w(uint8_t data)
-{
-	// This handler is called when a write occurs to the low byte
-	// at address 0xFD1FFF (within the word 0xFD1FFE).
-	// 'data' directly contains the 8-bit value written.
-	LOGCPU("LED Write: %02x\n", data);
-	for(int i=0; i<8; i++)
-		m_diag_led[i] = BIT(data, i);
-}
-
+uint16_t wxstar4k_state::buserr_r() { LOGWARN("%s: Bus error read access!\n", machine().describe_context()); if (!machine().side_effects_disabled()) { m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE); m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE); } return 0xffff; }
+void wxstar4k_state::led_w(uint8_t data) { LOGCPU("LED Write: %02x\n", data); for(int i=0; i<8; i++) m_diag_led[i] = BIT(data, i); }
 void wxstar4k_state::cpubd_watchdog_reset_w(offs_t offset, uint16_t data, uint16_t mem_mask) { LOGCPU("Watchdog reset write: %04X & %04X\n", data, mem_mask); m_main_watchdog = 0; }
 void wxstar4k_state::cpubd_gfx_irq6_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_15 && offset == 0) { LOGIRQ("%s: Main CPU triggering GFX CPU IRQ 6\n", machine().describe_context()); m_gfxcpu->set_input_line_and_vector(M68K_IRQ_6, ASSERT_LINE, m_gfx_irq_vector); } else { LOGCPU("Write to GFX IRQ trigger area offset %d, data %04X & %04X\n", offset, data, mem_mask); } }
 uint16_t wxstar4k_state::cpubd_io_status_r() { uint16_t status = m_io_latch_out->pending_r() ? 1 : 0; LOGCPU("%s: Read from I/O card status @ C00000 = %04X\n", machine().describe_context(), status); return status; }
 void wxstar4k_state::cpubd_io_control_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { LOGLATCH("Write to I/O card control/data @ C00000: data %02X -> Latch In\n", data & 0xff); m_io_latch_in->write(data & 0xff); } }
 uint16_t wxstar4k_state::cpubd_data_latch_r() { uint16_t data = m_data_latch_out->read(); LOGLATCH("%s: Read byte from Data card latch @ C0A400 = %02X\n", machine().describe_context(), data & 0xff); return data; }
 void wxstar4k_state::cpubd_data_latch_w(offs_t offset, uint16_t data, uint16_t mem_mask) { if (ACCESSING_BITS_0_7) { uint8_t byte_data = data & 0xff; if (offset == 0 || offset == 0x100) { LOGLATCH("Write byte to Data card latch @ %08X: data %02X\n", 0xC0A000 + (offset*2), byte_data); m_data_latch_in->write(byte_data); } else if (offset == 0x300) { LOGCPU("Write byte to audio control latch 1 @ C0A600: data %02X\n", byte_data); } else if (offset == 0x400) { LOGCPU("Write byte to audio control latch 2 @ C0A800: data %02X\n", byte_data); } } else { LOGCPU("Write to Data card area offset %X: data %04X & %04X\n", offset*2, data, mem_mask); } }
-
 
 void wxstar4k_state::cpubd_main_map(address_map &map)
 {
@@ -292,8 +272,7 @@ void wxstar4k_state::cpubd_main_map(address_map &map)
 	map(0xc0a000, 0xc0a801).rw(FUNC(wxstar4k_state::cpubd_data_latch_r), FUNC(wxstar4k_state::cpubd_data_latch_w));
 	map(0xc0a802, 0xfcffff).r(FUNC(wxstar4k_state::buserr_r));
 	map(0xfd0000, 0xfd1fff).ram().share("eeprom");
-	// Corrected mapping for LED write: map the word address, select low byte (lane 1)
-	map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).select(1);
+	map(0xfd1ffe, 0xfd1fff).w(FUNC(wxstar4k_state::led_w)).select(1); // Use select(1) for low byte
 	map(0xfd8000, 0xfd800f).rw(m_ptm, FUNC(ptm6840_device::read), FUNC(ptm6840_device::write)).umask16(0x00ff);
 	map(0xfdf000, 0xfdf007).w(FUNC(wxstar4k_state::cpubd_gfx_irq6_w));
 	map(0xfdf008, 0xfdf009).w(FUNC(wxstar4k_state::cpubd_watchdog_reset_w));
@@ -458,17 +437,18 @@ void wxstar4k_state::io_latch_irq_w(int state)
 	LOGIRQ("I/O Latch IRQ -> Main CPU IRQ 2 %s\n", state ? "Assert" : "Clear");
 	m_maincpu->set_input_line_and_vector(M68K_IRQ_2, state ? ASSERT_LINE : CLEAR_LINE, m_cpu_irq_vector);
 }
-void wxstar4k_state::kbd_put_key(uint8_t scancode)
+// Correct signature for generic_keyboard_device callback
+void wxstar4k_state::kbd_put_key(u8 data)
 {
-	LOGIO("Keyboard received scancode %02X\n", scancode);
-	m_io_kbd_data = scancode;
+	LOGIO("Keyboard received scancode %02X\n", data);
+	m_io_kbd_data = data;
 	m_io_kbd_status |= 1;
 	// TODO: Assert 8031 interrupt?
 }
 
 static INPUT_PORTS_START( wxstar4k )
-	PORT_START("KEYBOARD") // Tag must match the AT_KEYBOARD device tag (KBD_TAG)
-	PORT_INCLUDE(at_keyboard)
+	PORT_START(KBD_TAG) // Use KBD_TAG here
+	PORT_INCLUDE(generic_keyboard) // Use generic keyboard include
 INPUT_PORTS_END
 
 
@@ -523,8 +503,9 @@ void wxstar4k_state::wxstar4k(machine_config &config)
 	m_rs232->dsr_handler().set(m_uart, FUNC(i8251_device::write_dsr));
 	m_rs232->cts_handler().set(m_uart, FUNC(i8251_device::write_cts));
 
-	AT_KEYBOARD(config, KBD_TAG, 0); // Instantiate with correct tag
-	m_kbd->keypress().set(FUNC(wxstar4k_state::kbd_put_key));
+	// Use generic keyboard device
+	GENERIC_KEYBOARD(config, KBD_TAG, 0);
+	subdevice<generic_keyboard_device>(KBD_TAG)->set_keyboard_callback(FUNC(wxstar4k_state::kbd_put_key));
 
 	/* Latches for Inter-CPU Communication */
 	GENERIC_LATCH_8(config, m_gfx_latch_in);

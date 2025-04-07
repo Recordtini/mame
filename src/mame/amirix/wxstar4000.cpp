@@ -357,20 +357,62 @@ void wxstar4k_state::vidbd_sub_p3_w(uint8_t data) { }
 
 uint8_t wxstar4k_state::databd_latch_in_r() { uint8_t data = m_data_latch_in->read(); LOGLATCH("Data 8344 reads latch from main CPU = %02X\n", data); return data; }
 void wxstar4k_state::databd_latch_out_w(uint8_t data) { LOGLATCH("Data 8344 writes latch to main CPU = %02X\n", data); m_data_latch_out->write(data); }
-uint8_t wxstar4k_state::databd_pio1_r(offs_t offset){ LOGDATA("Read PIO1 offset %d\n", offset); return 0; }
-void wxstar4k_state::databd_pio1_w(offs_t offset, uint8_t data){ LOGDATA("Write PIO1 offset %d = %02X\n", offset, data); }
-uint8_t wxstar4k_state::databd_pio2_r(offs_t offset){ LOGDATA("Read PIO2 offset %d\n", offset); return 0; }
-void wxstar4k_state::databd_pio2_w(offs_t offset, uint8_t data){ LOGDATA("Write PIO2 offset %d = %02X\n", offset, data); }
+uint8_t wxstar4k_state::databd_pio1_r(offs_t offset)
+{
+	switch(offset) {
+		case 0: LOGDATA("Read PIO1 Command/Status\n"); break;
+		case 1: LOGDATA("Read PIO1 Port A (VME Addr/Data?)\n"); break;
+		case 2: LOGDATA("Read PIO1 Port B (Rear Switches?)\n"); /* TODO: return m_rear_switches->read(); */ break;
+		case 3: LOGDATA("Read PIO1 Port C\n"); break;
+		case 4: LOGDATA("Read PIO1 Transfer Count Low\n"); break;
+		case 5: LOGDATA("Read PIO1 Transfer Count High\n"); break;
+	}
+	return 0;
+}
+void wxstar4k_state::databd_pio1_w(offs_t offset, uint8_t data)
+{
+	switch(offset) {
+		case 0: LOGDATA("Write PIO1 Command/Status = %02X\n", data); break;
+		case 1: LOGDATA("Write PIO1 Port A (VME Addr/Data?) = %02X\n", data); break;
+		case 2: LOGDATA("Write PIO1 Port B (Rear Switches?) = %02X\n", data); break;
+		case 3: LOGDATA("Write PIO1 Port C = %02X\n", data); break;
+		case 4: LOGDATA("Write PIO1 Transfer Count Low = %02X\n", data); break;
+		case 5: LOGDATA("Write PIO1 Transfer Count High = %02X\n", data); break;
+	}
+}
+uint8_t wxstar4k_state::databd_pio2_r(offs_t offset)
+{
+	switch(offset) {
+		case 0: LOGDATA("Read PIO2 Command/Status\n"); break;
+		case 1: LOGDATA("Read PIO2 Port A (LEDs?)\n"); break;
+		case 2: LOGDATA("Read PIO2 Port B (DTMF/LED?)\n"); break;
+		case 3: LOGDATA("Read PIO2 Port C (Indicators?)\n"); break;
+		case 4: LOGDATA("Read PIO2 Transfer Count Low\n"); break;
+		case 5: LOGDATA("Read PIO2 Transfer Count High\n"); break;
+	}
+	return 0;
+}
+void wxstar4k_state::databd_pio2_w(offs_t offset, uint8_t data)
+{
+	switch(offset) {
+		case 0: LOGDATA("Write PIO2 Command/Status = %02X\n", data); break;
+		case 1: LOGDATA("Write PIO2 Port A (Indicator LEDs) = %02X\n", data); /* TODO: Update LEDs */ break;
+		case 2: LOGDATA("Write PIO2 Port B (DTMF dialer + LED) = %02X\n", data); /* TODO: Update DTMF/LED */ break;
+		case 3: LOGDATA("Write PIO2 Port C (bus clear, charging indicator) = %02X\n", data); /* TODO: Update indicators */ break;
+		case 4: LOGDATA("Write PIO2 Transfer Count Low = %02X\n", data); break;
+		case 5: LOGDATA("Write PIO2 Transfer Count High = %02X\n", data); break;
+	}
+}
 
 void wxstar4k_state::databd_main_map(address_map &map) { map(0x0000, 0x1fff).rom().region("datacpu", 0); }
 void wxstar4k_state::databd_main_io_map(address_map &map)
 {
 	map(0x0000, 0x01ff).ram();
-	map(0x0200, 0x0201).noprw();
+	map(0x0200, 0x0201).noprw(); // UART
 	map(0x2000, 0x2000).r(FUNC(wxstar4k_state::databd_latch_in_r)); // Guessed addr
 	map(0x2001, 0x2001).w(FUNC(wxstar4k_state::databd_latch_out_w)); // Guessed addr
-	map(0x8000, 0x8005).rw(FUNC(wxstar4k_state::databd_pio1_r), FUNC(wxstar4k_state::databd_pio1_w));
-	map(0x8100, 0x8105).rw(FUNC(wxstar4k_state::databd_pio2_r), FUNC(wxstar4k_state::databd_pio2_w));
+	map(0x8000, 0x8005).rw(FUNC(wxstar4k_state::databd_pio1_r), FUNC(wxstar4k_state::databd_pio1_w)); // PIO1
+	map(0x8100, 0x8105).rw(FUNC(wxstar4k_state::databd_pio2_r), FUNC(wxstar4k_state::databd_pio2_w)); // PIO2
 }
 
 // --- I/O Board 8031 ---
@@ -407,12 +449,15 @@ void wxstar4k_state::machine_start()
 	m_nvram->set_base(memshare("eeprom")->ptr(), 0x2000);
 }
 
+// Use memcpy for cleaner reset vector copy
 void wxstar4k_state::machine_reset()
 {
+	// Copy reset vector using memcpy
 	uint16_t *ram = m_mainram.target();
-	uint16_t *rom = (uint16_t *)memregion("maincpu")->base();
-	ram[0] = rom[0]; ram[1] = rom[1]; // SP
-	ram[2] = rom[2]; ram[3] = rom[3]; // PC
+	uint16_t *rom = memregion("maincpu")->as_u16(); // Use helper
+	memcpy(ram, rom, 8); // Copy SP (4 bytes) + PC (4 bytes) = 8 bytes
+
+	// Reset internal state
 	m_cpu_irq_vector = 0;
 	m_gfx_irq_vector = 0;
 	m_main_watchdog = 0;
@@ -421,6 +466,8 @@ void wxstar4k_state::machine_reset()
 	m_gfx_sub_p1 = 0xff;
 	m_io_kbd_data = 0;
 	m_io_kbd_status = 0;
+
+	// Reset sub-CPUs
 	m_gfxcpu->reset();
 	m_gfxsubcpu->reset();
 	m_datacpu->reset();

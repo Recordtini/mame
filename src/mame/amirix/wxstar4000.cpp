@@ -454,7 +454,8 @@ void wxstar4k_state::machine_reset()
 {
 	// Copy reset vector using memcpy
 	uint16_t *ram = m_mainram.target();
-	uint16_t *rom = memregion("maincpu")->as_u16(); // Use helper
+	// Get base pointer and cast
+	uint16_t *rom = (uint16_t *)memregion("maincpu")->base();
 	memcpy(ram, rom, 8); // Copy SP (4 bytes) + PC (4 bytes) = 8 bytes
 
 	// Reset internal state

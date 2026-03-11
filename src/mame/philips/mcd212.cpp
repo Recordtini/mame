@@ -318,10 +318,18 @@ int mcd212_device::get_border_width()
 	return width;
 }
 
-uint32_t mcd212_device::get_backdrop_plane()
+uint32_t mcd212_device::get_backdrop_plane(int x, int y)
 {
 	if (BIT(m_image_coding_method, ICM_EV_BIT))
-		return 0; // External Video Background. Default to Black since there is no DVC.
+	{
+		if (m_external_video_enabled
+			&& y >= 0 && y < m_external_video.height()
+			&& x >= 0 && x < m_external_video.width())
+		{
+			return m_external_video.pix(y, x);
+		}
+		return 0;
+	}
 	else
 		return s_4bpp_color[m_backdrop_color];
 }
@@ -648,7 +656,7 @@ const uint32_t mcd212_device::s_4bpp_color[16] =
 };
 
 template <bool MosaicA, bool MosaicB, bool OrderAB>
-void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *plane_b, bool *transparent_b, uint32_t *out)
+void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *plane_b, bool *transparent_b, uint32_t *out, int y)
 {
 	const uint8_t icmA = get_icm<0>();
 	const uint8_t icmB = get_icm<1>();
@@ -675,7 +683,7 @@ void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *
 	{
 		if (transparent_a[x] && transparent_b[x])
 		{
-			out[x] = get_backdrop_plane();
+			out[x] = get_backdrop_plane(x, y);
 			continue;
 		}
 		uint32_t plane_a_cur = MosaicA ? plane_a[x - (x % mosaic_count_a)] : plane_a[x];
@@ -1008,28 +1016,28 @@ uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 			switch (mixing_mode & 7)
 			{
 				case 0: // No Mosaic A/B, A->B->Backdrop plane ordering
-					mix_lines<false, false, true>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<false, false, true>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 1: // Mosaic A, No Mosaic B, A->B->Backdrop plane ordering
-					mix_lines<true, false, true>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<true, false, true>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 2: // No Mosaic A, Mosaic B, A->B->Backdrop plane ordering
-					mix_lines<false, true, true>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<false, true, true>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 3: // Mosaic A/B, A->B->Backdrop plane ordering
-					mix_lines<true, true, true>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<true, true, true>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 4: // No Mosaic A/B, B->A->Backdrop plane ordering
-					mix_lines<false, false, false>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<false, false, false>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 5: // Mosaic A, No Mosaic B, B->A->Backdrop plane ordering
-					mix_lines<true, false, false>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<true, false, false>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 6: // No Mosaic A, Mosaic B, B->A->Backdrop plane ordering
-					mix_lines<false, true, false>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<false, true, false>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 				case 7: // Mosaic A/B, B->A->Backdrop plane ordering
-					mix_lines<true, true, false>(plane_a, transparent_a, plane_b, transparent_b, out);
+					mix_lines<true, true, false>(plane_a, transparent_a, plane_b, transparent_b, out, scanline - m_ica_height);
 					break;
 			}
 
@@ -1169,6 +1177,9 @@ void mcd212_device::device_start()
 {
 	static const uint8_t s_dyuv_deltas[16] = { 0, 1, 4, 9, 16, 27, 44, 79, 128, 177, 212, 229, 240, 247, 252, 255 };
 
+	m_external_video.allocate(768, 312);
+	clear_external_video();
+
 	for (uint16_t d = 0; d < 0x100; d++)
 	{
 		m_delta_y_lut[d] = s_dyuv_deltas[d & 15];
@@ -1219,6 +1230,7 @@ void mcd212_device::device_start()
 
 	save_item(NAME(m_blink_time));
 	save_item(NAME(m_blink_active));
+	save_item(NAME(m_external_video_enabled));
 
 	save_item(NAME(m_interlace_field));
 
@@ -1227,4 +1239,9 @@ void mcd212_device::device_start()
 
 	m_ica_timer = timer_alloc(FUNC(mcd212_device::ica_tick), this);
 	m_ica_timer->adjust(attotime::never);
+}
+
+void mcd212_device::clear_external_video()
+{
+	m_external_video.fill(0xff000000);
 }

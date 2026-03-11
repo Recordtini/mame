@@ -50,6 +50,9 @@ TODO:
 #include "emu.h"
 #include "cdi.h"
 
+#define PL_MPEG_IMPLEMENTATION
+#include "pl_mpeg.h"
+
 #include "cpu/m6805/m6805.h"
 #include "imagedev/cdromimg.h"
 #include "machine/timekpr.h"
@@ -63,6 +66,59 @@ TODO:
 #include "cdrom.h"
 
 #include "cdi.lh"
+
+#include <array>
+
+namespace
+{
+constexpr uint32_t DVC_VMPEG_ROM_BASE = 0xe40000;
+constexpr uint32_t DVC_VMPEG_ROM_MASK = 0x1ffff;
+constexpr size_t DVC_PLM_BUFFER_CAPACITY = 512 * 1024;
+
+constexpr uint16_t DVC_FMA_ISR_EOI = 0x0001;
+constexpr uint16_t DVC_FMA_ISR_CSU = 0x0002;
+constexpr uint16_t DVC_FMA_ISR_UPD = 0x0004;
+constexpr uint16_t DVC_FMA_ISR_DEC = 0x0010;
+constexpr uint16_t DVC_FMA_ISR_POLL = 0x0100;
+
+constexpr uint16_t DVC_FMV_ISR_PIC = 0x0004;
+constexpr uint16_t DVC_FMV_ISR_TIM = 0x0100;
+constexpr uint16_t DVC_FMV_ISR_VCUP = 0x2000;
+
+constexpr uint8_t SCC_DMA_CSR_COC = 0x80;
+constexpr uint8_t SCC_DMA_SEQ_MAC_INC = 0x04;
+constexpr uint8_t SCC_DMA_SEQ_DAC_INC = 0x01;
+
+uint16_t dvc_frame_period_90khz(double rate_hz)
+{
+	return rate_hz > 0.0 ? uint16_t(90000.0 / rate_hz) : 0;
+}
+
+uint16_t dvc_rate_code(double rate_hz)
+{
+	if (rate_hz >= 55.0)
+		return 7;
+	if (rate_hz >= 45.0)
+		return 6;
+	if (rate_hz >= 29.5)
+		return 5;
+	if (rate_hz >= 29.0)
+		return 4;
+	if (rate_hz >= 24.5)
+		return 3;
+	if (rate_hz >= 23.9)
+		return 2;
+	if (rate_hz >= 23.0)
+		return 1;
+	return 0;
+}
+
+int16_t dvc_float_to_sample(float sample)
+{
+	const int value = int(sample * 32767.0f);
+	return int16_t(std::max(-32768, std::min(32767, value)));
+}
+} // anonymous namespace
 
 // TODO: NTSC system clock is 30.2098 MHz; additional 4.9152 MHz XTAL provided for UART
 #define CLOCK_A 30_MHz_XTAL
@@ -186,15 +242,67 @@ INPUT_PORTS_END
 *  Machine Initialization  *
 ***************************/
 
+void cdi_state::machine_start()
+{
+	m_dvc_video_timer = timer_alloc(FUNC(cdi_state::dvc_video_tick), this);
+
+	save_item(NAME(m_dvc_fma_command));
+	save_item(NAME(m_dvc_fma_status));
+	save_item(NAME(m_dvc_fma_interrupt_status));
+	save_item(NAME(m_dvc_fma_interrupt_enable));
+	save_item(NAME(m_dvc_fma_interrupt_vector));
+	save_item(NAME(m_dvc_fma_stream));
+	save_item(NAME(m_dvc_fma_dsp_addr));
+	save_item(NAME(m_dvc_fma_dclk));
+
+	save_item(NAME(m_dvc_fmv_interrupt_status));
+	save_item(NAME(m_dvc_fmv_interrupt_enable));
+	save_item(NAME(m_dvc_fmv_interrupt_vector));
+	save_item(NAME(m_dvc_fmv_system_command));
+	save_item(NAME(m_dvc_fmv_video_command));
+	save_item(NAME(m_dvc_fmv_system_control));
+	save_item(NAME(m_dvc_fmv_timer_compare));
+	save_item(NAME(m_dvc_fmv_frame_rate));
+	save_item(NAME(m_dvc_fmv_decoder_command));
+	save_item(NAME(m_dvc_fmv_video_data_input_command));
+	save_item(NAME(m_dvc_fmv_stream));
+	save_item(NAME(m_dvc_fmv_y_offset));
+	save_item(NAME(m_dvc_fmv_x_offset));
+	save_item(NAME(m_dvc_fmv_y_active));
+	save_item(NAME(m_dvc_fmv_x_active));
+	save_item(NAME(m_dvc_fmv_y_display));
+	save_item(NAME(m_dvc_fmv_x_display));
+	save_item(NAME(m_dvc_fmv_window_height));
+	save_item(NAME(m_dvc_fmv_window_width));
+	save_item(NAME(m_dvc_fmv_decoder_offset_y));
+	save_item(NAME(m_dvc_fmv_decoder_offset_x));
+	save_item(NAME(m_dvc_image_width));
+	save_item(NAME(m_dvc_image_height));
+	save_item(NAME(m_dvc_image_rt));
+
+	save_item(NAME(m_dvc_decoder_enabled));
+	save_item(NAME(m_dvc_playback_active));
+	save_item(NAME(m_dvc_video_visible));
+	save_item(NAME(m_dvc_video_show_pending));
+	save_item(NAME(m_dvc_fma_started));
+	save_item(NAME(m_dvc_frame_rate_hz));
+	save_item(NAME(m_dvc_dclk_base));
+
+	machine().save().register_postload(save_prepost_delegate(FUNC(cdi_state::dvc_rebuild_external_video), this));
+}
+
 void cdi_state::machine_reset()
 {
 	uint16_t *src = &m_main_rom[0];
 	uint16_t *dst = &m_plane_ram[0][0];
 	memcpy(dst, src, 0x8);
+	dvc_reset();
 }
 
 void quizard_state::machine_start()
 {
+	cdi_state::machine_start();
+
 	save_item(NAME(m_boot_press));
 
 	m_boot_timer = timer_alloc(FUNC(quizard_state::boot_press_tick), this);
@@ -347,15 +455,647 @@ void quizard_state::mcu_p3_w(uint8_t data)
 *     DVC cartridge      *
 *************************/
 
+TIMER_CALLBACK_MEMBER(cdi_state::dvc_video_tick)
+{
+	if (!m_dvc_playback_active)
+		return;
+
+	dvc_raise_fmv_irq(DVC_FMV_ISR_TIM);
+	if (m_dvc_fma_started)
+		dvc_raise_fma_irq(DVC_FMA_ISR_POLL);
+
+	dvc_present_next_frame();
+
+	if (m_dvc_video_timer && m_dvc_playback_active)
+		m_dvc_video_timer->adjust(attotime::from_hz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
+}
+
+uint8_t cdi_state::dvc_iack_r()
+{
+	const bool fma_pending = (m_dvc_fma_interrupt_status & m_dvc_fma_interrupt_enable) != 0;
+	const bool fmv_pending = (m_dvc_fmv_interrupt_status & m_dvc_fmv_interrupt_enable) != 0;
+
+	if (fma_pending)
+		return m_dvc_fma_interrupt_vector & 0xff;
+	if (fmv_pending)
+		return (m_dvc_fmv_interrupt_vector >> 3) & 0xff;
+	return 0xff;
+}
+
+void cdi_state::dvc_reset()
+{
+	m_dvc_dclk_base = machine().time().as_ticks(45000);
+
+	m_dvc_fma_command = 0;
+	m_dvc_fma_status = 0;
+	m_dvc_fma_interrupt_status = 0;
+	m_dvc_fma_interrupt_enable = 0;
+	m_dvc_fma_interrupt_vector = 0;
+	m_dvc_fma_stream = 0;
+	m_dvc_fma_dsp_addr = 0;
+	m_dvc_fma_dclk = 0;
+
+	m_dvc_fmv_interrupt_status = 0;
+	m_dvc_fmv_interrupt_enable = 0;
+	m_dvc_fmv_interrupt_vector = 0;
+	m_dvc_fmv_system_command = 0;
+	m_dvc_fmv_video_command = 0;
+	m_dvc_fmv_system_control = 0;
+	m_dvc_fmv_timer_compare = 56 - 1;
+	m_dvc_fmv_frame_rate = 0;
+	m_dvc_fmv_decoder_command = 0;
+	m_dvc_fmv_video_data_input_command = 0;
+	m_dvc_fmv_stream = 0;
+	m_dvc_fmv_y_offset = 0;
+	m_dvc_fmv_x_offset = 0;
+	m_dvc_fmv_y_active = 0;
+	m_dvc_fmv_x_active = 0;
+	m_dvc_fmv_y_display = 0;
+	m_dvc_fmv_x_display = 0;
+	m_dvc_fmv_window_height = 0;
+	m_dvc_fmv_window_width = 0;
+	m_dvc_fmv_decoder_offset_y = 0;
+	m_dvc_fmv_decoder_offset_x = 0;
+	m_dvc_image_width = 0;
+	m_dvc_image_height = 0;
+	m_dvc_image_rt = 0;
+
+	m_dvc_decoder_enabled = false;
+	m_dvc_playback_active = false;
+	m_dvc_video_visible = false;
+	m_dvc_video_show_pending = false;
+	m_dvc_fma_started = false;
+	m_dvc_frame_rate_hz = 25.0;
+
+	dvc_reset_video_decoder();
+	dvc_reset_audio_decoder();
+	dvc_rebuild_external_video();
+
+	if (m_dvc_video_timer)
+		m_dvc_video_timer->adjust(attotime::never);
+
+	dvc_update_irq();
+}
+
+void cdi_state::dvc_reset_video_decoder()
+{
+	if (m_dvc_video_plm)
+	{
+		plm_destroy(m_dvc_video_plm);
+		m_dvc_video_plm = nullptr;
+		m_dvc_video_buffer = nullptr;
+	}
+
+	m_dvc_video_queue.clear();
+	m_dvc_display_frame = dvc_video_frame();
+	m_dvc_image_width = 0;
+	m_dvc_image_height = 0;
+	m_dvc_image_rt = 0;
+	m_dvc_fmv_video_data_input_command &= ~0x4000;
+
+	m_dvc_video_buffer = plm_buffer_create_with_capacity(DVC_PLM_BUFFER_CAPACITY);
+	m_dvc_video_plm = m_dvc_video_buffer ? plm_create_with_buffer(m_dvc_video_buffer, TRUE) : nullptr;
+	if (m_dvc_video_plm)
+	{
+		plm_set_audio_enabled(m_dvc_video_plm, FALSE);
+		plm_set_video_enabled(m_dvc_video_plm, TRUE);
+	}
+}
+
+void cdi_state::dvc_reset_audio_decoder()
+{
+	if (m_dvc_audio_plm)
+	{
+		plm_destroy(m_dvc_audio_plm);
+		m_dvc_audio_plm = nullptr;
+		m_dvc_audio_buffer = nullptr;
+	}
+
+	m_dvc_audio_buffer = plm_buffer_create_with_capacity(DVC_PLM_BUFFER_CAPACITY);
+	m_dvc_audio_plm = m_dvc_audio_buffer ? plm_create_with_buffer(m_dvc_audio_buffer, TRUE) : nullptr;
+	if (m_dvc_audio_plm)
+	{
+		plm_set_video_enabled(m_dvc_audio_plm, FALSE);
+		plm_set_audio_enabled(m_dvc_audio_plm, TRUE);
+		plm_set_audio_stream(m_dvc_audio_plm, m_dvc_fma_stream & 0x0003);
+	}
+}
+
+void cdi_state::dvc_update_irq()
+{
+	const bool fma_pending = (m_dvc_fma_interrupt_status & m_dvc_fma_interrupt_enable) != 0;
+	const bool fmv_pending = (m_dvc_fmv_interrupt_status & m_dvc_fmv_interrupt_enable) != 0;
+	m_maincpu->in5_w((fma_pending || fmv_pending) ? ASSERT_LINE : CLEAR_LINE);
+}
+
+void cdi_state::dvc_raise_fmv_irq(uint16_t bits)
+{
+	if (!bits)
+		return;
+
+	m_dvc_fmv_interrupt_status |= bits;
+	dvc_update_irq();
+}
+
+void cdi_state::dvc_raise_fma_irq(uint16_t bits)
+{
+	if (!bits)
+		return;
+
+	m_dvc_fma_interrupt_status |= bits;
+	dvc_update_irq();
+}
+
+void cdi_state::dvc_handle_fmv_command(uint16_t data)
+{
+	m_dvc_fmv_system_command = data;
+
+	if (data & 0x2000)
+	{
+		m_dvc_decoder_enabled = false;
+		m_dvc_playback_active = false;
+		m_dvc_video_visible = false;
+		m_dvc_video_show_pending = false;
+		dvc_reset_video_decoder();
+		dvc_rebuild_external_video();
+	}
+
+	if (data & 0x0100)
+	{
+		m_dvc_playback_active = false;
+		dvc_reset_video_decoder();
+		dvc_rebuild_external_video();
+	}
+
+	if (data & 0x1000)
+	{
+		m_dvc_decoder_enabled = true;
+		dvc_reset_video_decoder();
+	}
+
+	if (data & 0x8000)
+		dvc_handle_dma_transfer(true);
+
+	if (data & 0x0008)
+	{
+		m_dvc_playback_active = true;
+		m_dvc_decoder_enabled = true;
+	}
+
+	if (data & 0x0010)
+		m_dvc_playback_active = false;
+
+	if (data & 0x0020)
+		m_dvc_playback_active = true;
+
+	if (data & 0x0040)
+	{
+		m_dvc_playback_active = false;
+		dvc_present_next_frame();
+	}
+
+	if (data & 0x0080)
+		m_dvc_playback_active = false;
+
+	if (m_dvc_video_timer)
+	{
+		if (m_dvc_playback_active)
+			m_dvc_video_timer->adjust(attotime::from_hz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
+		else
+			m_dvc_video_timer->adjust(attotime::never);
+	}
+}
+
+void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
+{
+	m_dvc_fmv_video_command = data;
+
+	if (data & 0x0100)
+	{
+		m_dvc_video_visible = false;
+		m_dvc_video_show_pending = false;
+		dvc_rebuild_external_video();
+	}
+
+	if (data & 0x0020)
+	{
+		m_dvc_video_visible = true;
+		m_dvc_video_show_pending = false;
+		dvc_rebuild_external_video();
+	}
+
+	if (data & 0x0200)
+	{
+		m_dvc_video_visible = true;
+		m_dvc_video_show_pending = false;
+		dvc_rebuild_external_video();
+	}
+
+	if (data & 0x0400)
+		m_dvc_video_show_pending = true;
+
+	if (data & 0x0008)
+	{
+		dvc_rebuild_external_video();
+		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP);
+	}
+}
+
+void cdi_state::dvc_handle_fma_command(uint16_t data)
+{
+	m_dvc_fma_command = data;
+
+	if (data & 0x0001)
+	{
+		m_dvc_fma_started = false;
+		m_dvc_fma_status = 0;
+		dvc_reset_audio_decoder();
+	}
+
+	if (data & 0x0002)
+		m_dvc_fma_started = true;
+
+	if (data & 0x8000)
+	{
+		m_dvc_fma_started = true;
+		m_dvc_fma_status &= ~0x08;
+		dvc_handle_dma_transfer(false);
+	}
+}
+
+void cdi_state::dvc_handle_dma_transfer(bool video)
+{
+	auto &dma = m_maincpu->dma().channel[1];
+	address_space &program = m_maincpu->space(AS_PROGRAM);
+
+	uint32_t memory_address = dma.memory_address_counter & 0x00fffffe;
+	uint32_t device_address = dma.device_address_counter;
+	const bool increment_memory = (dma.sequence_control & SCC_DMA_SEQ_MAC_INC) != 0;
+	const bool increment_device = (dma.sequence_control & SCC_DMA_SEQ_DAC_INC) != 0;
+
+	for (uint32_t remaining = dma.transfer_counter; remaining > 0; remaining--)
+	{
+		dvc_feed_word(video, program.read_word(memory_address));
+
+		if (increment_memory)
+			memory_address = (memory_address + 2) & 0x00fffffe;
+		if (increment_device)
+			device_address = (device_address + 2) & 0x00fffffe;
+	}
+
+	dma.memory_address_counter = memory_address;
+	dma.device_address_counter = device_address;
+	dma.transfer_counter = 0;
+	dma.channel_status |= SCC_DMA_CSR_COC;
+
+	if (video)
+		dvc_decode_video();
+	else
+		dvc_decode_audio();
+}
+
+void cdi_state::dvc_feed_word(bool video, uint16_t data)
+{
+	const uint8_t bytes[2] = { uint8_t(data >> 8), uint8_t(data) };
+	dvc_feed_bytes(video, bytes, 2);
+}
+
+void cdi_state::dvc_feed_bytes(bool video, const uint8_t *data, size_t bytes)
+{
+	if (video && !m_dvc_video_plm)
+		dvc_reset_video_decoder();
+	if (!video && !m_dvc_audio_plm)
+		dvc_reset_audio_decoder();
+
+	plm_buffer_t *const buffer = video ? m_dvc_video_buffer : m_dvc_audio_buffer;
+	if (!buffer || !data || !bytes)
+		return;
+
+	plm_buffer_write(buffer, const_cast<uint8_t *>(data), bytes);
+}
+
+void cdi_state::dvc_decode_video()
+{
+	if (!m_dvc_video_plm)
+		return;
+
+	if (const double rate_hz = plm_get_framerate(m_dvc_video_plm); rate_hz > 0.0)
+	{
+		m_dvc_frame_rate_hz = rate_hz;
+		m_dvc_image_rt = dvc_rate_code(rate_hz);
+	}
+
+	while (m_dvc_video_queue.size() < 8)
+	{
+		plm_frame_t *const frame = plm_decode_video(m_dvc_video_plm);
+		if (!frame)
+			break;
+
+		dvc_video_frame queued;
+		queued.width = frame->width;
+		queued.height = frame->height;
+		queued.pixels.resize(size_t(frame->width) * size_t(frame->height));
+
+		std::vector<uint8_t> rgba(size_t(frame->width) * size_t(frame->height) * 4);
+		plm_frame_to_rgba(frame, rgba.data(), frame->width * 4);
+		for (size_t index = 0; index < queued.pixels.size(); index++)
+		{
+			const uint8_t *const pixel = &rgba[index * 4];
+			queued.pixels[index] = rgb_t(0xff, pixel[0], pixel[1], pixel[2]);
+		}
+
+		m_dvc_image_width = frame->width;
+		m_dvc_image_height = frame->height;
+		m_dvc_fmv_video_data_input_command |= 0x4000;
+		m_dvc_video_queue.push_back(std::move(queued));
+	}
+
+	if (m_dvc_playback_active && m_dvc_video_timer)
+		m_dvc_video_timer->adjust(attotime::from_hz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
+}
+
+void cdi_state::dvc_decode_audio()
+{
+	if (!m_dvc_audio_plm)
+		return;
+
+	if (const int sample_rate = plm_get_samplerate(m_dvc_audio_plm); sample_rate > 0)
+	{
+		m_dmadac[0]->enable(1);
+		m_dmadac[0]->set_frequency(sample_rate);
+		m_dmadac[0]->set_volume(0x100);
+		m_dmadac[1]->enable(1);
+		m_dmadac[1]->set_frequency(sample_rate);
+		m_dmadac[1]->set_volume(0x100);
+	}
+
+	bool decoded_any = false;
+	for (;;)
+	{
+		plm_samples_t *const samples = plm_decode_audio(m_dvc_audio_plm);
+		if (!samples)
+			break;
+
+		std::array<int16_t, PLM_AUDIO_SAMPLES_PER_FRAME> left;
+		std::array<int16_t, PLM_AUDIO_SAMPLES_PER_FRAME> right;
+		for (unsigned int index = 0; index < samples->count; index++)
+		{
+			left[index] = dvc_float_to_sample(samples->interleaved[index * 2 + 0]);
+			right[index] = dvc_float_to_sample(samples->interleaved[index * 2 + 1]);
+		}
+
+		m_dmadac[0]->transfer(0, 1, 1, samples->count, left.data());
+		m_dmadac[1]->transfer(0, 1, 1, samples->count, right.data());
+		decoded_any = true;
+	}
+
+	if (decoded_any)
+	{
+		if (!(m_dvc_fma_status & 0x10))
+		{
+			m_dvc_fma_status |= 0x10;
+			dvc_raise_fma_irq(DVC_FMA_ISR_DEC);
+		}
+
+		m_dvc_fma_status |= 0x04;
+		dvc_raise_fma_irq(DVC_FMA_ISR_UPD);
+	}
+	else if (m_dvc_fma_started && plm_has_ended(m_dvc_audio_plm))
+	{
+		m_dvc_fma_status |= 0x01;
+		dvc_raise_fma_irq(DVC_FMA_ISR_EOI);
+	}
+}
+
+void cdi_state::dvc_present_next_frame()
+{
+	if (m_dvc_video_queue.empty())
+		return;
+
+	m_dvc_display_frame = std::move(m_dvc_video_queue.front());
+	m_dvc_video_queue.pop_front();
+
+	if (m_dvc_video_show_pending)
+	{
+		m_dvc_video_show_pending = false;
+		m_dvc_video_visible = true;
+	}
+
+	dvc_rebuild_external_video();
+	dvc_raise_fmv_irq(DVC_FMV_ISR_PIC);
+}
+
+void cdi_state::dvc_rebuild_external_video()
+{
+	m_mcd212->clear_external_video();
+
+	if (!m_dvc_video_visible || m_dvc_display_frame.pixels.empty())
+	{
+		m_mcd212->set_external_video_enable(false);
+		return;
+	}
+
+	bitmap_rgb32 &bitmap = m_mcd212->external_video();
+	const int src_x = std::min<int>(m_dvc_fmv_decoder_offset_x, m_dvc_display_frame.width);
+	const int src_y = std::min<int>(m_dvc_fmv_decoder_offset_y, m_dvc_display_frame.height);
+	const int max_copy_w = int(m_dvc_display_frame.width) - src_x;
+	const int max_copy_h = int(m_dvc_display_frame.height) - src_y;
+	const int copy_w = std::max(0, std::min<int>(m_dvc_fmv_window_width ? m_dvc_fmv_window_width : m_dvc_fmv_x_active ? m_dvc_fmv_x_active : max_copy_w, max_copy_w));
+	const int copy_h = std::max(0, std::min<int>(m_dvc_fmv_window_height ? m_dvc_fmv_window_height : m_dvc_fmv_y_active ? m_dvc_fmv_y_active : max_copy_h, max_copy_h));
+	const int dest_x = m_dvc_fmv_x_display ? m_dvc_fmv_x_display : m_dvc_fmv_x_offset;
+	const int dest_y = m_dvc_fmv_y_display ? m_dvc_fmv_y_display : m_dvc_fmv_y_offset;
+
+	if (copy_w <= 0 || copy_h <= 0 || dest_x >= bitmap.width() || dest_y >= bitmap.height())
+	{
+		m_mcd212->set_external_video_enable(false);
+		return;
+	}
+
+	for (int y = 0; y < copy_h && (dest_y + y) < bitmap.height(); y++)
+	{
+		uint32_t *const dst = &bitmap.pix(dest_y + y, dest_x);
+		const uint32_t *const src = &m_dvc_display_frame.pixels[size_t(src_y + y) * m_dvc_display_frame.width + src_x];
+		for (int x = 0; x < copy_w && (dest_x + x) < bitmap.width(); x++)
+			dst[x] = src[x];
+	}
+
+	m_mcd212->set_external_video_enable(true);
+}
+
 uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 {
-	LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = 0000 & %04x\n", machine().describe_context(), 0xe80000 + (offset << 1), mem_mask);
-	return 0;
+	const uint32_t address = 0xe00000 + (offset << 1);
+	const uint32_t current_dclk = uint32_t(machine().time().as_ticks(45000) - m_dvc_dclk_base);
+	m_dvc_fma_dclk = current_dclk;
+
+	if (m_dvc_rom.found() && address >= DVC_VMPEG_ROM_BASE && address <= 0xe7fffe)
+	{
+		const uint32_t rom_offset = 0x40000 + ((address - DVC_VMPEG_ROM_BASE) & DVC_VMPEG_ROM_MASK);
+		const uint16_t data = (m_dvc_rom[rom_offset] << 8) | m_dvc_rom[rom_offset + 1];
+		LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+		return data;
+	}
+
+	uint16_t data = 0;
+	switch (address & 0xffff)
+	{
+	case 0x3000: data = m_dvc_fma_command; break;
+	case 0x3002: data = 0x0200 | m_dvc_fma_status; break;
+	case 0x3004: data = 0x0007; break;
+	case 0x3006: data = 0x0900; break;
+	case 0x3008: data = m_dvc_fma_stream & 0x000f; break;
+	case 0x300a: data = m_dvc_fma_stream & 0x000f; break;
+	case 0x300c: data = m_dvc_fma_interrupt_vector; break;
+	case 0x300e: data = 0x0042; break;
+	case 0x3010: data = current_dclk >> 16; break;
+	case 0x3012: data = current_dclk & 0xffff; break;
+	case 0x3014: data = 0; break;
+	case 0x3016: data = 0; break;
+	case 0x3018: data = m_dvc_fma_started ? 1 : 0; break;
+	case 0x301a:
+		data = m_dvc_fma_interrupt_status;
+		if (!machine().side_effects_disabled())
+		{
+			m_dvc_fma_interrupt_status = 0;
+			dvc_update_irq();
+		}
+		break;
+	case 0x301c: data = m_dvc_fma_interrupt_enable; break;
+	case 0x3024: data = 0x0004; break;
+
+	case 0x4002: data = m_dvc_image_width; break;
+	case 0x4004: data = m_dvc_image_height; break;
+	case 0x4006: data = m_dvc_image_rt; break;
+	case 0x4052: data = m_dvc_image_width; break;
+	case 0x4054: data = m_dvc_image_height; break;
+	case 0x4056: data = m_dvc_image_rt; break;
+	case 0x405e: data = 0x2000; break;
+	case 0x4060: data = m_dvc_fmv_interrupt_enable; break;
+	case 0x4062:
+		data = m_dvc_fmv_interrupt_status;
+		if (!machine().side_effects_disabled())
+		{
+			m_dvc_fmv_interrupt_status = 0;
+			dvc_update_irq();
+		}
+		break;
+	case 0x4064: data = m_dvc_fmv_timer_compare; break;
+	case 0x406c: data = m_dvc_fmv_y_offset; break;
+	case 0x406e: data = m_dvc_fmv_x_offset; break;
+	case 0x4070: data = m_dvc_fmv_y_active; break;
+	case 0x4072: data = m_dvc_fmv_x_active; break;
+	case 0x4074: data = m_dvc_fmv_y_display; break;
+	case 0x4076: data = m_dvc_fmv_x_display; break;
+	case 0x4078: data = m_dvc_fmv_window_height; break;
+	case 0x407a: data = m_dvc_fmv_window_width; break;
+	case 0x407c: data = m_dvc_fmv_decoder_offset_y; break;
+	case 0x407e: data = m_dvc_fmv_decoder_offset_x; break;
+	case 0x4088: data = m_dvc_fmv_decoder_command; break;
+	case 0x408c: data = m_dvc_fmv_video_data_input_command; break;
+	case 0x4098: data = current_dclk >> 6; break;
+	case 0x409c: data = 0; break;
+	case 0x409e: data = 0xfe96; break;
+	case 0x40a0: data = 0; break;
+	case 0x40a4: data = uint16_t(std::min<size_t>(31, m_dvc_video_queue.size())); break;
+	case 0x40a8: data = dvc_frame_period_90khz(m_dvc_frame_rate_hz); break;
+	case 0x40aa: data = dvc_frame_period_90khz(m_dvc_frame_rate_hz); break;
+	case 0x40ac: data = m_dvc_fmv_frame_rate; break;
+	case 0x40c0: data = m_dvc_fmv_system_command; break;
+	case 0x40c2: data = m_dvc_fmv_video_command; break;
+	case 0x40c4: data = m_dvc_fmv_stream & 0x000f; break;
+	case 0x40c6: data = m_dvc_fmv_system_control; break;
+	case 0x40dc: data = m_dvc_fmv_interrupt_vector; break;
+	case 0x40e6: data = 0; break;
+	default:
+		LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = 0000 & %04x\n", machine().describe_context(), address, mem_mask);
+		return 0;
+	}
+
+	LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+	return data;
 }
 
 void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	LOGMASKED(LOG_DVC, "%s: dvc_w: %08x = %04x & %04x\n", machine().describe_context(), 0xe80000 + (offset << 1), data, mem_mask);
+	const uint32_t address = 0xe00000 + (offset << 1);
+
+	LOGMASKED(LOG_DVC, "%s: dvc_w: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+
+	switch (address & 0xffff)
+	{
+	case 0x3000:
+		COMBINE_DATA(&m_dvc_fma_command);
+		dvc_handle_fma_command(m_dvc_fma_command);
+		break;
+
+	case 0x3008:
+	case 0x300a:
+		COMBINE_DATA(&m_dvc_fma_stream);
+		m_dvc_fma_stream &= 0x000f;
+		if (m_dvc_audio_plm)
+			plm_set_audio_stream(m_dvc_audio_plm, m_dvc_fma_stream & 0x0003);
+		m_dvc_fma_status |= 0x02;
+		dvc_raise_fma_irq(DVC_FMA_ISR_CSU);
+		break;
+
+	case 0x300c:
+		COMBINE_DATA(&m_dvc_fma_interrupt_vector);
+		break;
+
+	case 0x301c:
+		COMBINE_DATA(&m_dvc_fma_interrupt_enable);
+		dvc_update_irq();
+		break;
+
+	case 0x3022:
+		COMBINE_DATA(&m_dvc_fma_dsp_addr);
+		break;
+
+	case 0x3024:
+		break;
+
+	case 0x4002: COMBINE_DATA(&m_dvc_image_width); break;
+	case 0x4004: COMBINE_DATA(&m_dvc_image_height); break;
+	case 0x4006: COMBINE_DATA(&m_dvc_image_rt); break;
+	case 0x4060:
+		COMBINE_DATA(&m_dvc_fmv_interrupt_enable);
+		dvc_update_irq();
+		break;
+	case 0x4064: COMBINE_DATA(&m_dvc_fmv_timer_compare); break;
+	case 0x406c: COMBINE_DATA(&m_dvc_fmv_y_offset); break;
+	case 0x406e: COMBINE_DATA(&m_dvc_fmv_x_offset); break;
+	case 0x4070: COMBINE_DATA(&m_dvc_fmv_y_active); break;
+	case 0x4072: COMBINE_DATA(&m_dvc_fmv_x_active); break;
+	case 0x4074: COMBINE_DATA(&m_dvc_fmv_y_display); break;
+	case 0x4076: COMBINE_DATA(&m_dvc_fmv_x_display); break;
+	case 0x4078: COMBINE_DATA(&m_dvc_fmv_window_height); break;
+	case 0x407a: COMBINE_DATA(&m_dvc_fmv_window_width); break;
+	case 0x407c: COMBINE_DATA(&m_dvc_fmv_decoder_offset_y); break;
+	case 0x407e: COMBINE_DATA(&m_dvc_fmv_decoder_offset_x); break;
+	case 0x4088: COMBINE_DATA(&m_dvc_fmv_decoder_command); break;
+	case 0x408c: COMBINE_DATA(&m_dvc_fmv_video_data_input_command); break;
+	case 0x40ac: COMBINE_DATA(&m_dvc_fmv_frame_rate); break;
+	case 0x40c0:
+		COMBINE_DATA(&m_dvc_fmv_system_command);
+		dvc_handle_fmv_command(m_dvc_fmv_system_command);
+		break;
+	case 0x40c2:
+		COMBINE_DATA(&m_dvc_fmv_video_command);
+		dvc_handle_fmv_video_command(m_dvc_fmv_video_command);
+		break;
+	case 0x40c4:
+		COMBINE_DATA(&m_dvc_fmv_stream);
+		m_dvc_fmv_stream &= 0x000f;
+		break;
+	case 0x40c6: COMBINE_DATA(&m_dvc_fmv_system_control); break;
+	case 0x40dc: COMBINE_DATA(&m_dvc_fmv_interrupt_vector); break;
+	case 0x40de:
+		dvc_feed_word(true, data);
+		dvc_decode_video();
+		break;
+	default:
+		break;
+	}
 }
 
 /*************************
@@ -428,6 +1168,7 @@ void cdi_state::cdimono1_base(machine_config &config)
 	SCC68070(config, m_maincpu, CLOCK_A);
 	m_maincpu->set_addrmap(AS_PROGRAM, &cdi_state::cdimono1_mem);
 	m_maincpu->iack4_callback().set(m_cdic, FUNC(cdicdic_device::intack_r));
+	m_maincpu->iack5_callback().set(FUNC(cdi_state::dvc_iack_r));
 
 	MCD212(config, m_mcd212, CLOCK_A, m_plane_ram[0], m_plane_ram[1]);
 	m_mcd212->set_screen("screen");
@@ -571,7 +1312,7 @@ void cdi_state::cdimono1(machine_config &config)
 	m_slave_hle->read_mousey().set_ioport("MOUSEY");
 	m_slave_hle->read_mousebtn().set_ioport("MOUSEBTN");
 
-	SOFTWARE_LIST(config, "cd_list").set_original("cdi").set_filter("!DVC");
+	SOFTWARE_LIST(config, "cd_list").set_original("cdi");
 	SOFTWARE_LIST(config, "photocd_list").set_compatible("photo_cd");
 }
 
@@ -626,6 +1367,11 @@ ROM_START( cdimono1 )
 	ROMX_LOAD( "cdi220b.rom", 0x000000, 0x80000, CRC(279683ca) SHA1(53360a1f21ddac952e95306ced64186a3fc0b93e), ROM_BIOS(1) )
 	ROM_SYSTEM_BIOS( 2, "pcdi220_alt", "Philips CD-i 220?" ) // doesn't boot
 	ROMX_LOAD( "cdi220.rom", 0x000000, 0x80000, CRC(584c0af8) SHA1(5d757ab46b8c8fc36361555d978d7af768342d47), ROM_BIOS(2) )
+
+	ROM_REGION(0x60000, "mpegs", 0)
+	ROM_LOAD( "impega.rom", 0x00000, 0x40000, CRC(84d6f6aa) SHA1(02526482a0851ea2a7b582d8afaa8ef14a8bd914) )
+	ROM_LOAD16_BYTE( "fmv ffd9 p7308 r4.1 vmpeg.bin", 0x40000, 0x10000, CRC(30ba9273) SHA1(d8adca0627b356ced6131b9458ac1175e43e6548) )
+	ROM_LOAD16_BYTE( "fmv 4ba9 p7307 r4.1 vmpeg.bin", 0x40001, 0x10000, CRC(623edb1f) SHA1(4c6b11e28ad4c2f5c2e439f7910a783e0a79d1a9) )
 
 	// The two MCU dumps below are taken from the cdi910. We still need dumps from a Mono-I board in case the revisions are different.
 	ROM_REGION(0x2000, "servo", 0)

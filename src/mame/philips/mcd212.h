@@ -48,6 +48,9 @@ public:
 	auto int_callback() { return m_int_callback.bind(); }
 
 	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+	bitmap_rgb32 &external_video() { return m_external_video; }
+	void clear_external_video();
+	void set_external_video_enable(bool enable) { m_external_video_enabled = enable; }
 
 	void map(address_map &map) ATTR_COLD;
 
@@ -204,6 +207,8 @@ protected:
 	uint32_t m_backdrop_color = 0;
 	uint32_t m_mosaic_hold[2]{};
 	uint8_t m_weight_factor[2][768]{};
+	bitmap_rgb32 m_external_video;
+	bool m_external_video_enabled = false;
 
 	// DYUV color limit arrays.
 	uint32_t m_dyuv_limit_lut[0x300];
@@ -253,7 +258,7 @@ protected:
 
 	int get_screen_width();
 	int get_border_width();
-	uint32_t get_backdrop_plane();
+	uint32_t get_backdrop_plane(int x, int y);
 
 	template <int Path> void set_vsr(uint32_t value);
 	template <int Path> uint32_t get_vsr();
@@ -274,7 +279,7 @@ protected:
 
 	template <int Path> void set_register(uint8_t reg, uint32_t value);
 
-	template <bool MosaicA, bool MosaicB, bool OrderAB> void mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *plane_b, bool *transparent_b, uint32_t *out);
+	template <bool MosaicA, bool MosaicB, bool OrderAB> void mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *plane_b, bool *transparent_b, uint32_t *out, int y);
 
 	void draw_cursor(uint32_t *scanline);
 };

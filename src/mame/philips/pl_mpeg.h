@@ -3514,8 +3514,33 @@ void plm_video_decode_block(plm_video_t *self, int block) {
 
 	int *s = self->block_data;
 	int si = 0;
-	
 
+	if (self->macroblock_intra) {
+		// Overwrite without prediction for intra-coded blocks.
+		if (n == 1) {
+			int clamped = plm_clamp((s[0] + 128) >> 8);
+			PLM_BLOCK_SET(d, di, dw, si, 8, 8, clamped);
+			s[0] = 0;
+		}
+		else {
+			plm_video_idct(s);
+			PLM_BLOCK_SET(d, di, dw, si, 8, 8, plm_clamp(s[si]));
+			memset(self->block_data, 0, sizeof(self->block_data));
+		}
+	}
+	else {
+		// Add residual data to the predicted macroblock.
+		if (n == 1) {
+			int value = (s[0] + 128) >> 8;
+			PLM_BLOCK_SET(d, di, dw, si, 8, 8, plm_clamp(d[di] + value));
+			s[0] = 0;
+		}
+		else {
+			plm_video_idct(s);
+			PLM_BLOCK_SET(d, di, dw, si, 8, 8, plm_clamp(d[di] + s[si]));
+			memset(self->block_data, 0, sizeof(self->block_data));
+		}
+	}
 }
 
 void plm_video_idct(int *block) {

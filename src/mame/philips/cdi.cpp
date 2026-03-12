@@ -129,7 +129,7 @@ int16_t dvc_float_to_sample(float sample)
 #define LOG_QUIZARD_OTHER   (1U << 4)
 #define LOG_UART            (1U << 5)
 
-#define VERBOSE         (0)
+#define VERBOSE         (LOG_DVC)
 #include "logmacro.h"
 
 #define ENABLE_UART_PRINTING (0)
@@ -156,7 +156,7 @@ void cdi_state::cdimono1_mem(address_map &map)
 	map(0x500000, 0x57ffff).ram();
 	map(0xd00000, 0xdfffff).ram(); // DVC RAM block 1
 	map(0xe00000, 0xe7ffff).rw(FUNC(cdi_state::dvc_r), FUNC(cdi_state::dvc_w));
-	map(0xe80000, 0xefffff).ram(); // DVC RAM block 2
+	map(0xe80000, 0xefffff).rw(FUNC(cdi_state::dvc_ram2_r), FUNC(cdi_state::dvc_ram2_w)); // DVC RAM block 2
 }
 
 void cdi_state::cdimono2_mem(address_map &map)
@@ -253,6 +253,7 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_fma_interrupt_vector));
 	save_item(NAME(m_dvc_fma_stream));
 	save_item(NAME(m_dvc_fma_dsp_addr));
+	save_item(NAME(m_dvc_fma_dsp_enable));
 	save_item(NAME(m_dvc_fma_dclk));
 
 	save_item(NAME(m_dvc_fmv_interrupt_status));
@@ -276,15 +277,21 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_fmv_window_width));
 	save_item(NAME(m_dvc_fmv_decoder_offset_y));
 	save_item(NAME(m_dvc_fmv_decoder_offset_x));
+	save_item(NAME(m_dvc_fmv_program));
 	save_item(NAME(m_dvc_image_width));
 	save_item(NAME(m_dvc_image_height));
 	save_item(NAME(m_dvc_image_rt));
+	save_item(NAME(m_dvc_fmv_program_ram));
+	save_item(NAME(m_dvc_ram2));
 
 	save_item(NAME(m_dvc_decoder_enabled));
 	save_item(NAME(m_dvc_playback_active));
 	save_item(NAME(m_dvc_video_visible));
 	save_item(NAME(m_dvc_video_show_pending));
 	save_item(NAME(m_dvc_fma_started));
+	save_item(NAME(m_dvc_mpeg_ram_enabled));
+	save_item(NAME(m_cdic_irq_pending));
+	save_item(NAME(m_dvc_mpeg_ram_enable_count));
 	save_item(NAME(m_dvc_frame_rate_hz));
 	save_item(NAME(m_dvc_dclk_base));
 
@@ -296,6 +303,7 @@ void cdi_state::machine_reset()
 	uint16_t *src = &m_main_rom[0];
 	uint16_t *dst = &m_plane_ram[0][0];
 	memcpy(dst, src, 0x8);
+	m_cdic_irq_pending = false;
 	dvc_reset();
 }
 
@@ -369,6 +377,16 @@ void cdi_state::bus_error_w(offs_t offset, uint16_t data)
 		m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
 		m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
 	}
+}
+
+void cdi_state::cdic_dvc_irq_w(int state)
+{
+	m_cdic_irq_pending = bool(state);
+
+	const bool dvc_pending = ((m_dvc_fma_interrupt_status & m_dvc_fma_interrupt_enable) != 0)
+		|| ((m_dvc_fmv_interrupt_status & m_dvc_fmv_interrupt_enable) != 0);
+
+	m_maincpu->in4_w((m_cdic_irq_pending || dvc_pending) ? ASSERT_LINE : CLEAR_LINE);
 }
 
 
@@ -482,8 +500,20 @@ uint8_t cdi_state::dvc_iack_r()
 	return 0xff;
 }
 
+uint8_t cdi_state::cdimono1_iack4_r()
+{
+	const bool fma_pending = (m_dvc_fma_interrupt_status & m_dvc_fma_interrupt_enable) != 0;
+	const bool fmv_pending = (m_dvc_fmv_interrupt_status & m_dvc_fmv_interrupt_enable) != 0;
+
+	if (fma_pending || fmv_pending)
+		return dvc_iack_r();
+
+	return m_cdic->intack_r();
+}
+
 void cdi_state::dvc_reset()
 {
+	LOGMASKED(LOG_DVC, "%s: DVC reset\n", machine().describe_context());
 	m_dvc_dclk_base = machine().time().as_ticks(45000);
 
 	m_dvc_fma_command = 0;
@@ -493,6 +523,7 @@ void cdi_state::dvc_reset()
 	m_dvc_fma_interrupt_vector = 0;
 	m_dvc_fma_stream = 0;
 	m_dvc_fma_dsp_addr = 0;
+	m_dvc_fma_dsp_enable = 0;
 	m_dvc_fma_dclk = 0;
 
 	m_dvc_fmv_interrupt_status = 0;
@@ -516,15 +547,20 @@ void cdi_state::dvc_reset()
 	m_dvc_fmv_window_width = 0;
 	m_dvc_fmv_decoder_offset_y = 0;
 	m_dvc_fmv_decoder_offset_x = 0;
+	m_dvc_fmv_program = 0;
 	m_dvc_image_width = 0;
 	m_dvc_image_height = 0;
 	m_dvc_image_rt = 0;
+	m_dvc_fmv_program_ram.fill(0);
+	m_dvc_ram2.fill(0);
 
 	m_dvc_decoder_enabled = false;
 	m_dvc_playback_active = false;
 	m_dvc_video_visible = false;
 	m_dvc_video_show_pending = false;
 	m_dvc_fma_started = false;
+	m_dvc_mpeg_ram_enabled = false;
+	m_dvc_mpeg_ram_enable_count = 0;
 	m_dvc_frame_rate_hz = 25.0;
 
 	dvc_reset_video_decoder();
@@ -539,6 +575,7 @@ void cdi_state::dvc_reset()
 
 void cdi_state::dvc_reset_video_decoder()
 {
+	LOGMASKED(LOG_DVC, "%s: DVC reset video decoder\n", machine().describe_context());
 	if (m_dvc_video_plm)
 	{
 		plm_destroy(m_dvc_video_plm);
@@ -564,6 +601,7 @@ void cdi_state::dvc_reset_video_decoder()
 
 void cdi_state::dvc_reset_audio_decoder()
 {
+	LOGMASKED(LOG_DVC, "%s: DVC reset audio decoder\n", machine().describe_context());
 	if (m_dvc_audio_plm)
 	{
 		plm_destroy(m_dvc_audio_plm);
@@ -585,7 +623,14 @@ void cdi_state::dvc_update_irq()
 {
 	const bool fma_pending = (m_dvc_fma_interrupt_status & m_dvc_fma_interrupt_enable) != 0;
 	const bool fmv_pending = (m_dvc_fmv_interrupt_status & m_dvc_fmv_interrupt_enable) != 0;
-	m_maincpu->in5_w((fma_pending || fmv_pending) ? ASSERT_LINE : CLEAR_LINE);
+	LOGMASKED(LOG_DVC, "%s: DVC IRQ update fma=%04x/%04x fmv=%04x/%04x -> %s\n",
+		machine().describe_context(),
+		m_dvc_fma_interrupt_status,
+		m_dvc_fma_interrupt_enable,
+		m_dvc_fmv_interrupt_status,
+		m_dvc_fmv_interrupt_enable,
+		(fma_pending || fmv_pending) ? "ASSERT" : "CLEAR");
+	cdic_dvc_irq_w(m_cdic_irq_pending ? ASSERT_LINE : CLEAR_LINE);
 }
 
 void cdi_state::dvc_raise_fmv_irq(uint16_t bits)
@@ -593,6 +638,7 @@ void cdi_state::dvc_raise_fmv_irq(uint16_t bits)
 	if (!bits)
 		return;
 
+	LOGMASKED(LOG_DVC, "%s: DVC raise FMV IRQ %04x\n", machine().describe_context(), bits);
 	m_dvc_fmv_interrupt_status |= bits;
 	dvc_update_irq();
 }
@@ -602,12 +648,14 @@ void cdi_state::dvc_raise_fma_irq(uint16_t bits)
 	if (!bits)
 		return;
 
+	LOGMASKED(LOG_DVC, "%s: DVC raise FMA IRQ %04x\n", machine().describe_context(), bits);
 	m_dvc_fma_interrupt_status |= bits;
 	dvc_update_irq();
 }
 
 void cdi_state::dvc_handle_fmv_command(uint16_t data)
 {
+	LOGMASKED(LOG_DVC, "%s: DVC FMV system command %04x\n", machine().describe_context(), data);
 	m_dvc_fmv_system_command = data;
 
 	if (data & 0x2000)
@@ -668,6 +716,7 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 
 void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
 {
+	LOGMASKED(LOG_DVC, "%s: DVC FMV video command %04x\n", machine().describe_context(), data);
 	m_dvc_fmv_video_command = data;
 
 	if (data & 0x0100)
@@ -703,11 +752,13 @@ void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
 
 void cdi_state::dvc_handle_fma_command(uint16_t data)
 {
+	LOGMASKED(LOG_DVC, "%s: DVC FMA command %04x\n", machine().describe_context(), data);
 	m_dvc_fma_command = data;
 
 	if (data & 0x0001)
 	{
 		m_dvc_fma_started = false;
+		m_dvc_fma_dsp_enable = 0;
 		m_dvc_fma_status = 0;
 		dvc_reset_audio_decoder();
 	}
@@ -727,6 +778,13 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 {
 	auto &dma = m_maincpu->dma().channel[1];
 	address_space &program = m_maincpu->space(AS_PROGRAM);
+	LOGMASKED(LOG_DVC, "%s: DVC DMA %s mac=%06x dac=%06x count=%04x seq=%02x\n",
+		machine().describe_context(),
+		video ? "video" : "audio",
+		dma.memory_address_counter & 0x00fffffe,
+		dma.device_address_counter,
+		dma.transfer_counter,
+		dma.sequence_control);
 
 	uint32_t memory_address = dma.memory_address_counter & 0x00fffffe;
 	uint32_t device_address = dma.device_address_counter;
@@ -791,6 +849,8 @@ void cdi_state::dvc_decode_video()
 		if (!frame)
 			break;
 
+		LOGMASKED(LOG_DVC, "%s: DVC decoded video frame %dx%d\n", machine().describe_context(), frame->width, frame->height);
+
 		dvc_video_frame queued;
 		queued.width = frame->width;
 		queued.height = frame->height;
@@ -851,6 +911,7 @@ void cdi_state::dvc_decode_audio()
 
 	if (decoded_any)
 	{
+		LOGMASKED(LOG_DVC, "%s: DVC decoded audio samples\n", machine().describe_context());
 		if (!(m_dvc_fma_status & 0x10))
 		{
 			m_dvc_fma_status |= 0x10;
@@ -874,6 +935,12 @@ void cdi_state::dvc_present_next_frame()
 
 	m_dvc_display_frame = std::move(m_dvc_video_queue.front());
 	m_dvc_video_queue.pop_front();
+	LOGMASKED(LOG_DVC, "%s: DVC present frame %dx%d queue=%u show_pending=%d\n",
+		machine().describe_context(),
+		m_dvc_display_frame.width,
+		m_dvc_display_frame.height,
+		unsigned(m_dvc_video_queue.size()),
+		m_dvc_video_show_pending ? 1 : 0);
 
 	if (m_dvc_video_show_pending)
 	{
@@ -888,6 +955,16 @@ void cdi_state::dvc_present_next_frame()
 void cdi_state::dvc_rebuild_external_video()
 {
 	m_mcd212->clear_external_video();
+	LOGMASKED(LOG_DVC, "%s: DVC rebuild ext video visible=%d pixels=%u window=%dx%d display=%dx%d offset=%dx%d\n",
+		machine().describe_context(),
+		m_dvc_video_visible ? 1 : 0,
+		unsigned(m_dvc_display_frame.pixels.size()),
+		m_dvc_fmv_window_width,
+		m_dvc_fmv_window_height,
+		m_dvc_fmv_x_display,
+		m_dvc_fmv_y_display,
+		m_dvc_fmv_x_offset,
+		m_dvc_fmv_y_offset);
 
 	if (!m_dvc_video_visible || m_dvc_display_frame.pixels.empty())
 	{
@@ -936,6 +1013,13 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 		return data;
 	}
 
+	if ((address & 0xffff) >= 0x4800 && (address & 0xffff) <= 0x7ffe)
+	{
+		const uint16_t data = m_dvc_fmv_program_ram[((address & 0xffff) - 0x4800) >> 1];
+		LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+		return data;
+	}
+
 	uint16_t data = 0;
 	switch (address & 0xffff)
 	{
@@ -951,7 +1035,7 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 	case 0x3012: data = current_dclk & 0xffff; break;
 	case 0x3014: data = 0; break;
 	case 0x3016: data = 0; break;
-	case 0x3018: data = m_dvc_fma_started ? 1 : 0; break;
+	case 0x3018: data = m_dvc_fma_dsp_enable & 0x0001; break;
 	case 0x301a:
 		data = m_dvc_fma_interrupt_status;
 		if (!machine().side_effects_disabled())
@@ -992,6 +1076,7 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 	case 0x407e: data = m_dvc_fmv_decoder_offset_x; break;
 	case 0x4088: data = m_dvc_fmv_decoder_command; break;
 	case 0x408c: data = m_dvc_fmv_video_data_input_command; break;
+	case 0x40da: data = m_dvc_fmv_program; break;
 	case 0x4098: data = current_dclk >> 6; break;
 	case 0x409c: data = 0; break;
 	case 0x409e: data = 0xfe96; break;
@@ -1021,6 +1106,16 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 	LOGMASKED(LOG_DVC, "%s: dvc_w: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
 
+	if (!m_dvc_mpeg_ram_enabled && m_dvc_mpeg_ram_enable_count < 0x40)
+	{
+		m_dvc_mpeg_ram_enable_count++;
+		if (m_dvc_mpeg_ram_enable_count == 0x40)
+		{
+			LOGMASKED(LOG_DVC, "%s: DVC MPEG RAM enabled\n", machine().describe_context());
+			m_dvc_mpeg_ram_enabled = true;
+		}
+	}
+
 	switch (address & 0xffff)
 	{
 	case 0x3000:
@@ -1045,6 +1140,11 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	case 0x301c:
 		COMBINE_DATA(&m_dvc_fma_interrupt_enable);
 		dvc_update_irq();
+		break;
+
+	case 0x3018:
+		COMBINE_DATA(&m_dvc_fma_dsp_enable);
+		m_dvc_fma_dsp_enable &= 0x0001;
 		break;
 
 	case 0x3022:
@@ -1074,6 +1174,10 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	case 0x407e: COMBINE_DATA(&m_dvc_fmv_decoder_offset_x); break;
 	case 0x4088: COMBINE_DATA(&m_dvc_fmv_decoder_command); break;
 	case 0x408c: COMBINE_DATA(&m_dvc_fmv_video_data_input_command); break;
+	case 0x40da:
+		COMBINE_DATA(&m_dvc_fmv_program);
+		LOGMASKED(LOG_DVC, "%s: DVC FMV program select %04x\n", machine().describe_context(), m_dvc_fmv_program);
+		break;
 	case 0x40ac: COMBINE_DATA(&m_dvc_fmv_frame_rate); break;
 	case 0x40c0:
 		COMBINE_DATA(&m_dvc_fmv_system_command);
@@ -1094,8 +1198,47 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		dvc_decode_video();
 		break;
 	default:
+		if ((address & 0xffff) >= 0x4800 && (address & 0xffff) <= 0x7ffe)
+		{
+			COMBINE_DATA(&m_dvc_fmv_program_ram[((address & 0xffff) - 0x4800) >> 1]);
+			break;
+		}
 		break;
 	}
+}
+
+uint16_t cdi_state::dvc_ram2_r(offs_t offset, uint16_t mem_mask)
+{
+	if (!m_dvc_mpeg_ram_enabled)
+	{
+		if (!machine().side_effects_disabled())
+		{
+			const uint32_t address = 0xe80000 + (offset << 1);
+			m_maincpu->set_buserror_details(address, true, m_maincpu->get_fc());
+			m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
+			m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
+		}
+		return 0xff;
+	}
+
+	return m_dvc_ram2[offset];
+}
+
+void cdi_state::dvc_ram2_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+{
+	if (!m_dvc_mpeg_ram_enabled)
+	{
+		if (!machine().side_effects_disabled())
+		{
+			const uint32_t address = 0xe80000 + (offset << 1);
+			m_maincpu->set_buserror_details(address, false, m_maincpu->get_fc());
+			m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
+			m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
+		}
+		return;
+	}
+
+	COMBINE_DATA(&m_dvc_ram2[offset]);
 }
 
 /*************************
@@ -1167,8 +1310,7 @@ void cdi_state::cdimono1_base(machine_config &config)
 {
 	SCC68070(config, m_maincpu, CLOCK_A);
 	m_maincpu->set_addrmap(AS_PROGRAM, &cdi_state::cdimono1_mem);
-	m_maincpu->iack4_callback().set(m_cdic, FUNC(cdicdic_device::intack_r));
-	m_maincpu->iack5_callback().set(FUNC(cdi_state::dvc_iack_r));
+	m_maincpu->iack4_callback().set(FUNC(cdi_state::cdimono1_iack4_r));
 
 	MCD212(config, m_mcd212, CLOCK_A, m_plane_ram[0], m_plane_ram[1]);
 	m_mcd212->set_screen("screen");
@@ -1194,7 +1336,7 @@ void cdi_state::cdimono1_base(machine_config &config)
 	// DSP input clock is 7.5264 MHz
 	CDI_CDIC(config, m_cdic, 45.1584_MHz_XTAL / 2);
 	m_cdic->set_clock2(45.1584_MHz_XTAL * 3 / 7); // generated by PLL circuit incorporating 19.3575 MHz XTAL
-	m_cdic->intreq_callback().set(m_maincpu, FUNC(scc68070_device::in4_w));
+	m_cdic->intreq_callback().set(FUNC(cdi_state::cdic_dvc_irq_w));
 
 	CDI_SLAVE_HLE(config, m_slave_hle, 0);
 	m_slave_hle->int_callback().set(m_maincpu, FUNC(scc68070_device::in2_w));

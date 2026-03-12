@@ -14,6 +14,7 @@
 #include "diserial.h"
 #include "screen.h"
 
+#include <array>
 #include <deque>
 #include <vector>
 
@@ -92,12 +93,16 @@ protected:
 
 	uint16_t dvc_r(offs_t offset, uint16_t mem_mask = ~0);
 	void dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
+	uint16_t dvc_ram2_r(offs_t offset, uint16_t mem_mask = ~0);
+	void dvc_ram2_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 
 	uint16_t bus_error_r(offs_t offset);
 	void bus_error_w(offs_t offset, uint16_t data);
+	void cdic_dvc_irq_w(int state);
 
 	TIMER_CALLBACK_MEMBER(dvc_video_tick);
 
+	uint8_t cdimono1_iack4_r();
 	uint8_t dvc_iack_r();
 	void dvc_reset();
 	void dvc_reset_video_decoder();
@@ -133,6 +138,7 @@ protected:
 	uint16_t m_dvc_fma_interrupt_vector = 0;
 	uint16_t m_dvc_fma_stream = 0;
 	uint16_t m_dvc_fma_dsp_addr = 0;
+	uint16_t m_dvc_fma_dsp_enable = 0;
 	uint32_t m_dvc_fma_dclk = 0;
 
 	uint16_t m_dvc_fmv_interrupt_status = 0;
@@ -156,15 +162,21 @@ protected:
 	uint16_t m_dvc_fmv_window_width = 0;
 	uint16_t m_dvc_fmv_decoder_offset_y = 0;
 	uint16_t m_dvc_fmv_decoder_offset_x = 0;
+	uint16_t m_dvc_fmv_program = 0;
 	uint16_t m_dvc_image_width = 0;
 	uint16_t m_dvc_image_height = 0;
 	uint16_t m_dvc_image_rt = 0;
+	std::array<uint16_t, 0x1c00> m_dvc_fmv_program_ram{};
+	std::array<uint16_t, 0x40000> m_dvc_ram2{};
 
 	bool m_dvc_decoder_enabled = false;
 	bool m_dvc_playback_active = false;
 	bool m_dvc_video_visible = false;
 	bool m_dvc_video_show_pending = false;
 	bool m_dvc_fma_started = false;
+	bool m_dvc_mpeg_ram_enabled = false;
+	bool m_cdic_irq_pending = false;
+	uint8_t m_dvc_mpeg_ram_enable_count = 0;
 	double m_dvc_frame_rate_hz = 25.0;
 	u64 m_dvc_dclk_base = 0;
 };

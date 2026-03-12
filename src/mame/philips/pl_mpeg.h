@@ -140,8 +140,8 @@ See below for detailed the API documentation.
 */
 
 
-#ifndef PL_MPEG_H
-#define PL_MPEG_H
+#ifndef MAME_PHILIPS_PL_MPEG_H
+#define MAME_PHILIPS_PL_MPEG_H
 
 #include <stdint.h>
 
@@ -813,7 +813,7 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self);
 }
 #endif
 
-#endif // PL_MPEG_H
+#endif // MAME_PHILIPS_PL_MPEG_H
 
 
 

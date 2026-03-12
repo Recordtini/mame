@@ -1567,6 +1567,7 @@ uint16_t scc68070_device::dma_r(offs_t offset, uint16_t mem_mask)
 		}
 		return (m_dma.channel[offset / 32].sequence_control << 8) | m_dma.channel[offset / 32].channel_control;
 	case 0x0a/2:
+	case 0x4a/2:
 		if (!machine().side_effects_disabled())
 			LOGMASKED(LOG_DMA, "%s: DMA(%d) Memory Transfer Counter Read: %04x & %04x\n", machine().describe_context(), offset / 32, m_dma.channel[offset / 32].transfer_counter, mem_mask);
 		return m_dma.channel[offset / 32].transfer_counter;
@@ -1629,6 +1630,8 @@ void scc68070_device::dma_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 			LOGMASKED(LOG_DMA, "%s: DMA(%d) Device Control Register Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 			m_dma.channel[offset / 32].device_control = data >> 8;
 		}
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 DCR/OCR=%02x/%02x mask=%04x\n", machine().describe_context(), m_dma.channel[1].device_control, m_dma.channel[1].operation_control, mem_mask);
 		break;
 	case 0x06/2:
 	case 0x46/2:
@@ -1647,34 +1650,47 @@ void scc68070_device::dma_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 			LOGMASKED(LOG_DMA, "%s: DMA(%d) Sequence Control Register Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 			m_dma.channel[offset / 32].sequence_control = data >> 8;
 		}
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 SCR/CCR=%02x/%02x status=%02x mask=%04x\n", machine().describe_context(), m_dma.channel[1].sequence_control, m_dma.channel[1].channel_control, m_dma.channel[1].channel_status, mem_mask);
 		break;
 	case 0x0a/2:
+	case 0x4a/2:
 		LOGMASKED(LOG_DMA, "%s: DMA(%d) Memory Transfer Counter Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 		COMBINE_DATA(&m_dma.channel[offset / 32].transfer_counter);
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 TC=%04x mask=%04x\n", machine().describe_context(), m_dma.channel[1].transfer_counter, mem_mask);
 		break;
 	case 0x0c/2:
 	case 0x4c/2:
 		LOGMASKED(LOG_DMA, "%s: DMA(%d) Memory Address Counter (High Word) Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 		m_dma.channel[offset / 32].memory_address_counter &= ~(mem_mask << 16);
 		m_dma.channel[offset / 32].memory_address_counter |= data << 16;
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 MAC=%08x (high write) mask=%04x\n", machine().describe_context(), m_dma.channel[1].memory_address_counter, mem_mask);
 		break;
 	case 0x0e/2:
 	case 0x4e/2:
 		LOGMASKED(LOG_DMA, "%s: DMA(%d) Memory Address Counter (Low Word) Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 		m_dma.channel[offset / 32].memory_address_counter &= ~mem_mask;
 		m_dma.channel[offset / 32].memory_address_counter |= data;
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 MAC=%08x (low write) mask=%04x\n", machine().describe_context(), m_dma.channel[1].memory_address_counter, mem_mask);
 		break;
 	case 0x14/2:
 	case 0x54/2:
 		LOGMASKED(LOG_DMA, "%s: DMA(%d) Device Address Counter (High Word) Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 		m_dma.channel[offset / 32].device_address_counter &= ~(mem_mask << 16);
 		m_dma.channel[offset / 32].device_address_counter |= data << 16;
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 DAC=%08x (high write) mask=%04x\n", machine().describe_context(), m_dma.channel[1].device_address_counter, mem_mask);
 		break;
 	case 0x16/2:
 	case 0x56/2:
 		LOGMASKED(LOG_DMA, "%s: DMA(%d) Device Address Counter (Low Word) Write: %04x & %04x\n", machine().describe_context(), offset / 32, data, mem_mask);
 		m_dma.channel[offset / 32].device_address_counter &= ~mem_mask;
 		m_dma.channel[offset / 32].device_address_counter |= data;
+		if ((offset / 32) == 1)
+			logerror("%s: DMA2 DAC=%08x (low write) mask=%04x\n", machine().describe_context(), m_dma.channel[1].device_address_counter, mem_mask);
 		break;
 	default:
 		LOGMASKED(LOG_DMA | LOG_UNKNOWN, "%s: DMA Unknown Register Write: %04x = %04x & %04x\n", machine().describe_context(), offset * 2, data, mem_mask);

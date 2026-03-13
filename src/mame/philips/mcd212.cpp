@@ -318,6 +318,16 @@ int mcd212_device::get_border_width()
 	return width;
 }
 
+int mcd212_device::get_dca_trigger_x()
+{
+	// The MCD212/MiSTer DCA fetch starts when the active picture ends and
+	// horizontal blank begins, not at the far-right edge of the line. In the
+	// 360/720-pixel mode the right-side masked border is already part of the
+	// blanking interval, so trigger DCA before that area rather than at a late
+	// fixed X position.
+	return get_border_width() + get_screen_width();
+}
+
 uint32_t mcd212_device::get_backdrop_plane(int x, int y)
 {
 	if (BIT(m_image_coding_method, ICM_EV_BIT))
@@ -326,7 +336,11 @@ uint32_t mcd212_device::get_backdrop_plane(int x, int y)
 			&& y >= 0 && y < m_external_video.height()
 			&& x >= 0 && x < m_external_video.width())
 		{
-			return m_external_video.pix(y, x);
+			const uint32_t ev_pix = m_external_video.pix(y, x);
+			// 0 marks untouched EV pixels; real DVC video is always written with
+			// an opaque alpha channel.
+			if (ev_pix >> 24)
+				return ev_pix;
 		}
 		return 0;
 	}
@@ -527,14 +541,24 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 	const uint8_t icm = get_icm<Path>();
 	const uint8_t tp_ctrl = get_transparency_control<Path>();
 	const int width = get_screen_width();
+	// DCR2 does not have a DE bit; MiSTer also keys per-plane visibility from
+	// IC1/IC2 alone and uses DCR1.DE only for global display timing.
+	const bool path_enabled = BIT(m_dcr[Path], DCR_ICA_BIT);
 
 	uint32_t vsr = get_vsr<Path>();
 	uint32_t vsr2 = get_vsr<!Path>();
 
-	if (tp_ctrl == TCR_ALWAYS || !icm || !vsr)
+	// The backdrop/external-video plane only needs higher image planes to be
+	// transparent if those paths are actually enabled. MiSTer models disabled
+	// paths as transparent, and titles like Repeat Offender rely on that.
+	if (!path_enabled || tp_ctrl == TCR_ALWAYS || !icm || !vsr)
 	{
-		std::fill_n(pixels, get_screen_width(), s_4bpp_color[0]);
-		std::fill_n(transparent, get_screen_width(), (tp_ctrl == TCR_ALWAYS));
+		std::fill_n(pixels, width, s_4bpp_color[0]);
+		// A plane with ICA disabled, no coding method, or no start address does
+		// not contribute picture data and should not block the backdrop/FM V
+		// plane. Repeat Offender relies on this when it blanks the base planes
+		// and leaves EV enabled for full-screen video.
+		std::fill_n(transparent, width, !path_enabled || (tp_ctrl == TCR_ALWAYS) || !icm || !vsr);
 		return;
 	}
 
@@ -678,11 +702,16 @@ void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *
 	uint32_t offset = (!BIT(m_dcr[0], DCR_CF_BIT) || BIT(m_csrw[0], CSR1W_ST_BIT)) ? 24 : 0;
 	std::fill_n(out, offset, s_4bpp_color[0]);
 	out += offset;
+	uint32_t backdrop_hits = 0;
+	uint32_t plane_a_hits = 0;
+	uint32_t plane_b_hits = 0;
+	uint32_t mixed_hits = 0;
 
 	for (int x = 0; x < width; x++)
 	{
 		if (transparent_a[x] && transparent_b[x])
 		{
+			backdrop_hits++;
 			out[x] = get_backdrop_plane(x, y);
 			continue;
 		}
@@ -726,6 +755,20 @@ void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *
 		const uint8_t out_g = std::clamp(weighted_a_g + weighted_b_g + 16, 0, 255);
 		const uint8_t out_b = std::clamp(weighted_a_b + weighted_b_b + 16, 0, 255);
 		out[x] = 0xff000000 | (out_r << 16) | (out_g << 8) | out_b;
+		if (!transparent_a[x] && !transparent_b[x])
+			mixed_hits++;
+		else if (!transparent_a[x])
+			plane_a_hits++;
+		else
+			plane_b_hits++;
+	}
+
+	if (m_external_video_enabled && BIT(m_image_coding_method, ICM_EV_BIT))
+	{
+		m_ev_backdrop_hits += backdrop_hits;
+		m_ev_plane_a_hits += plane_a_hits;
+		m_ev_plane_b_hits += plane_b_hits;
+		m_ev_mixed_hits += mixed_hits;
 	}
 
 	if (border_width)
@@ -963,10 +1006,11 @@ TIMER_CALLBACK_MEMBER(mcd212_device::dca_tick)
 		process_dca<1>();
 
 	int scanline = screen().vpos();
+	const int dca_x = get_dca_trigger_x();
 	if (scanline == m_total_height - 1)
-		m_dca_timer->adjust(screen().time_until_pos(m_ica_height, 784));
+		m_dca_timer->adjust(screen().time_until_pos(m_ica_height, dca_x));
 	else
-		m_dca_timer->adjust(screen().time_until_pos(scanline + 1, 784));
+		m_dca_timer->adjust(screen().time_until_pos(scanline + 1, dca_x));
 }
 
 uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
@@ -987,6 +1031,14 @@ uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 	// Process VSR and mix if we're in the visible region
 	if (scanline >= m_ica_height)
 	{
+		if (scanline == m_ica_height)
+		{
+			m_ev_backdrop_hits = 0;
+			m_ev_plane_a_hits = 0;
+			m_ev_plane_b_hits = 0;
+			m_ev_mixed_hits = 0;
+		}
+
 		uint32_t const bitmap_line = ((scanline - m_ica_height) << 1) + m_ica_height;
 		uint32_t *const out = &bitmap.pix(bitmap_line + BIT(~m_csrr[0], CSR1R_PA_BIT));
 		uint32_t *const out2 = &bitmap.pix(bitmap_line + BIT(m_csrr[0], CSR1R_PA_BIT));
@@ -1054,6 +1106,20 @@ uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 		{
 			// Single Field Output (duplicate lines)
 			std::copy_n(out, 768, out2);
+		}
+
+		if ((scanline == (m_total_height - 1)) && m_external_video_enabled && BIT(m_image_coding_method, ICM_EV_BIT))
+		{
+			logerror("MCD212 EV summary backdrop=%u plane_a=%u plane_b=%u mixed=%u icm=%06x tcr=%06x dcr=%04x/%04x order=%u\n",
+				m_ev_backdrop_hits,
+				m_ev_plane_a_hits,
+				m_ev_plane_b_hits,
+				m_ev_mixed_hits,
+				m_image_coding_method,
+				m_transparency_control,
+				m_dcr[0],
+				m_dcr[1],
+				m_plane_order);
 		}
 	}
 
@@ -1152,7 +1218,7 @@ void mcd212_device::device_reset()
 
 	m_int_callback(CLEAR_LINE);
 
-	m_dca_timer->adjust(screen().time_until_pos(m_ica_height, 784));
+	m_dca_timer->adjust(screen().time_until_pos(m_ica_height, get_dca_trigger_x()));
 	m_ica_timer->adjust(screen().time_until_pos(m_ica_height, 0));
 }
 
@@ -1231,6 +1297,10 @@ void mcd212_device::device_start()
 	save_item(NAME(m_blink_time));
 	save_item(NAME(m_blink_active));
 	save_item(NAME(m_external_video_enabled));
+	save_item(NAME(m_ev_backdrop_hits));
+	save_item(NAME(m_ev_plane_a_hits));
+	save_item(NAME(m_ev_plane_b_hits));
+	save_item(NAME(m_ev_mixed_hits));
 
 	save_item(NAME(m_interlace_field));
 
@@ -1243,5 +1313,7 @@ void mcd212_device::device_start()
 
 void mcd212_device::clear_external_video()
 {
-	m_external_video.fill(0xff000000);
+	// Keep unwritten EV pixels distinguishable from drawn DVC video so the
+	// backdrop path can ignore untouched areas cleanly.
+	m_external_video.fill(0x00000000);
 }

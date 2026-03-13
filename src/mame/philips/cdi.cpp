@@ -681,8 +681,7 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 	// once we have a short runway, then allow much smaller resumes after a pause
 	// so Joy-style sparse decode bursts don't produce long silent holes.
 	constexpr size_t audio_start_prebuffer_samples = 2304;
-	constexpr size_t audio_resume_prebuffer_samples = 128;
-	constexpr uint8_t audio_empty_grace_ticks = 192;
+	constexpr size_t audio_resume_prebuffer_samples = 64;
 	const size_t resume_threshold = m_dvc_audio_output_started_once ? audio_resume_prebuffer_samples : audio_start_prebuffer_samples;
 
 	// MiSTer enables the FMA DSP when the stream start time is reached; the
@@ -723,12 +722,13 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 		if (!m_dvc_audio_output_active)
 			return;
 
-		if (m_dvc_audio_empty_ticks != 0xff)
+		if (m_dvc_audio_empty_ticks != 0xffff)
 			m_dvc_audio_empty_ticks++;
 
-		// MiSTer lets the PCM output glide toward zero while its local FIFO is
-		// empty. Keep doing that for a while before we actually pause output so
-		// short Joy-specific packet gaps don't become audible dead air.
+		// MiSTer effectively holds the last sample while playback is starved and
+		// only nudges the DC bias toward zero slowly. Decaying to silence across
+		// every sample in one 64-sample block is much too aggressive and turns
+		// short Joy packet gaps into audible silent holes.
 		std::vector<int16_t> decay(chunk_samples * 2);
 		int16_t left = m_dvc_audio_output_level[0];
 		int16_t right = m_dvc_audio_output_level[1];
@@ -736,27 +736,25 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 		{
 			decay[index * 2 + 0] = left;
 			decay[index * 2 + 1] = right;
-			if (left > 0)
-				left--;
-			else if (left < 0)
-				left++;
-			if (right > 0)
-				right--;
-			else if (right < 0)
-				right++;
 		}
+
+		if (left > 0)
+			left--;
+		else if (left < 0)
+			left++;
+		if (right > 0)
+			right--;
+		else if (right < 0)
+			right++;
 
 		m_dvc_audio_output_level[0] = left;
 		m_dvc_audio_output_level[1] = right;
 
 		dmadac_sound_device *dac_list[2] = { m_dmadac[0], m_dmadac[1] };
 		dmadac_transfer(dac_list, 2, 1, 2, chunk_samples, decay.data());
-
-		if (m_dvc_audio_empty_ticks < audio_empty_grace_ticks)
-			return;
-
-		LOGMASKED(LOG_DVC, "%s: DVC audio output pause\n", machine().describe_context());
-		m_dvc_audio_output_active = false;
+		// Keep local output running through sparse Joy-style bursts. Hardware-visible
+		// stop/reset still comes from the FMA command path, not from our software PCM
+		// queue briefly running dry between valid packets.
 		return;
 	}
 
@@ -1648,12 +1646,34 @@ void cdi_state::dvc_present_next_frame()
 
 	m_dvc_display_frame = std::move(m_dvc_video_queue.front());
 	m_dvc_video_queue.pop_front();
-	LOGMASKED(LOG_DVC, "%s: DVC present frame %dx%d queue=%u show_pending=%d\n",
+	uint32_t sample_luma_min = 0xff;
+	uint32_t sample_luma_max = 0x00;
+	uint32_t sample_nonblack = 0;
+	if (!m_dvc_display_frame.pixels.empty())
+	{
+		const size_t step = std::max<size_t>(size_t(1), m_dvc_display_frame.pixels.size() / 256);
+		for (size_t i = 0; i < m_dvc_display_frame.pixels.size(); i += step)
+		{
+			const uint32_t pixel = m_dvc_display_frame.pixels[i];
+			const uint32_t r = (pixel >> 16) & 0xff;
+			const uint32_t g = (pixel >> 8) & 0xff;
+			const uint32_t b = pixel & 0xff;
+			const uint32_t luma = (r * 77 + g * 150 + b * 29) >> 8;
+			sample_luma_min = std::min(sample_luma_min, luma);
+			sample_luma_max = std::max(sample_luma_max, luma);
+			if ((r | g | b) != 0)
+				sample_nonblack++;
+		}
+	}
+	LOGMASKED(LOG_DVC, "%s: DVC present frame %dx%d queue=%u show_pending=%d sample_nonblack=%u luma=%u-%u\n",
 		machine().describe_context(),
 		m_dvc_display_frame.width,
 		m_dvc_display_frame.height,
 		unsigned(m_dvc_video_queue.size()),
-		m_dvc_video_show_pending ? 1 : 0);
+		m_dvc_video_show_pending ? 1 : 0,
+		sample_nonblack,
+		sample_luma_min,
+		sample_luma_max);
 
 	if (m_dvc_video_show_pending)
 	{
@@ -1712,8 +1732,20 @@ void cdi_state::dvc_rebuild_external_video()
 	const int draw_h = std::max(0, source_h);
 	// Titles like Repeat Offender leave Xd/Yd at zero and rely on Xo/Yo for
 	// placement, while others program explicit display positions.
-	const int dest_x = m_dvc_fmv_x_display ? (int(m_dvc_fmv_x_display) * 2) : int(m_dvc_fmv_x_offset);
+	// Both Xd and Xo are programmed in half-resolution horizontal units, so
+	// either source must be expanded to the 768-pixel MCD212 backdrop space.
+	const int dest_x = m_dvc_fmv_x_display ? (int(m_dvc_fmv_x_display) * 2) : (int(m_dvc_fmv_x_offset) * 2);
 	const int dest_y = m_dvc_fmv_y_display ? int(m_dvc_fmv_y_display) : int(m_dvc_fmv_y_offset);
+	LOGMASKED(LOG_DVC, "%s: DVC ext video map src=%dx%d+%d+%d draw=%dx%d dest=%d,%d\n",
+		machine().describe_context(),
+		source_w,
+		source_h,
+		src_x,
+		src_y,
+		draw_w,
+		draw_h,
+		dest_x,
+		dest_y);
 
 	if (source_w <= 0 || source_h <= 0 || draw_w <= 0 || draw_h <= 0
 		|| dest_x >= bitmap.width() || dest_y >= bitmap.height())

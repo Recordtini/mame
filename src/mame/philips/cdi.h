@@ -245,7 +245,7 @@ protected:
 	int16_t m_dvc_audio_output_level[2] = { 0, 0 };
 	uint8_t m_dvc_mpeg_ram_enable_count = 0;
 	uint8_t m_dvc_dma_preview_count = 0;
-	uint8_t m_dvc_audio_empty_ticks = 0;
+	uint16_t m_dvc_audio_empty_ticks = 0;
 	uint32_t m_dvc_video_present_accum = 0;
 	uint32_t m_dvc_audio_sample_rate = 0;
 	uint32_t m_dvc_audio_dma_last_mac = 0;

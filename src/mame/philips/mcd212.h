@@ -209,6 +209,10 @@ protected:
 	uint8_t m_weight_factor[2][768]{};
 	bitmap_rgb32 m_external_video;
 	bool m_external_video_enabled = false;
+	uint32_t m_ev_backdrop_hits = 0;
+	uint32_t m_ev_plane_a_hits = 0;
+	uint32_t m_ev_plane_b_hits = 0;
+	uint32_t m_ev_mixed_hits = 0;
 
 	// DYUV color limit arrays.
 	uint32_t m_dyuv_limit_lut[0x300];
@@ -258,6 +262,7 @@ protected:
 
 	int get_screen_width();
 	int get_border_width();
+	int get_dca_trigger_x();
 	uint32_t get_backdrop_plane(int x, int y);
 
 	template <int Path> void set_vsr(uint32_t value);

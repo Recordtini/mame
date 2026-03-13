@@ -3867,6 +3867,7 @@ static const plm_quantizer_spec_t PLM_AUDIO_QUANT_TAB[] = {
 struct plm_audio_t {
 	double time;
 	int samples_decoded;
+	uint32_t header;
 	int samplerate_index;
 	int bitrate_index;
 	int version;
@@ -4044,8 +4045,9 @@ int plm_audio_decode_header(plm_audio_t *self) {
 	}
 
 	int padding = plm_buffer_read(self->buffer, 1);
-	plm_buffer_skip(self->buffer, 1); // f_private
+	int private_bit = plm_buffer_read(self->buffer, 1);
 	int mode = plm_buffer_read(self->buffer, 2);
+	int mode_extension = plm_buffer_read(self->buffer, 2);
 
 	// If we already have a header, make sure the samplerate, bitrate and mode
 	// are still the same, otherwise we might have missed sync.
@@ -4066,15 +4068,26 @@ int plm_audio_decode_header(plm_audio_t *self) {
 
 	// Parse the mode_extension, set up the stereo bound
 	if (mode == PLM_AUDIO_MODE_JOINT_STEREO) {
-		self->bound = (plm_buffer_read(self->buffer, 2) + 1) << 2;
+		self->bound = (mode_extension + 1) << 2;
 	}
 	else {
-		plm_buffer_skip(self->buffer, 2);
 		self->bound = (mode == PLM_AUDIO_MODE_MONO) ? 0 : 32;
 	}
 
-	// Discard the last 4 bits of the header and the CRC value, if present
-	plm_buffer_skip(self->buffer, 4); // copyright(1), original(1), emphasis(2)
+	int footer_bits = plm_buffer_read(self->buffer, 4); // copyright(1), original(1), emphasis(2)
+	self->header =
+		((uint32_t)sync << 21) |
+		((uint32_t)self->version << 19) |
+		((uint32_t)self->layer << 17) |
+		((uint32_t)(hasCRC ? 0 : 1) << 16) |
+		((uint32_t)(bitrate_index + 1) << 12) |
+		((uint32_t)samplerate_index << 10) |
+		((uint32_t)padding << 9) |
+		((uint32_t)private_bit << 8) |
+		((uint32_t)mode << 6) |
+		((uint32_t)mode_extension << 4) |
+		(uint32_t)footer_bits;
+
 	if (hasCRC) {
 		plm_buffer_skip(self->buffer, 16);
 	}

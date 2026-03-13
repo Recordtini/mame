@@ -237,6 +237,7 @@ protected:
 	bool m_dvc_fma_started = false;
 	bool m_dvc_fma_pending_stream_change = false;
 	bool m_dvc_audio_output_active = false;
+	bool m_dvc_audio_output_started_once = false;
 	bool m_dvc_fmv_register_update_latch = false;
 	bool m_dvc_fmv_register_update_scroll = false;
 	bool m_dvc_mpeg_ram_enabled = false;
@@ -247,6 +248,8 @@ protected:
 	uint8_t m_dvc_audio_empty_ticks = 0;
 	uint32_t m_dvc_video_present_accum = 0;
 	uint32_t m_dvc_audio_sample_rate = 0;
+	uint32_t m_dvc_audio_dma_last_mac = 0;
+	uint32_t m_dvc_audio_dma_span_hint = 0;
 	double m_dvc_frame_rate_hz = 25.0;
 	u64 m_dvc_dclk_base = 0;
 };

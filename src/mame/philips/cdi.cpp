@@ -74,15 +74,23 @@ namespace
 constexpr uint32_t DVC_VMPEG_ROM_BASE = 0xe40000;
 constexpr uint32_t DVC_VMPEG_ROM_MASK = 0x1ffff;
 constexpr size_t DVC_PLM_BUFFER_CAPACITY = 512 * 1024;
+constexpr uint32_t DVC_DMA_FALLBACK_MAX_BYTES = 0x2000;
 
 constexpr uint16_t DVC_FMA_ISR_EOI = 0x0001;
 constexpr uint16_t DVC_FMA_ISR_CSU = 0x0002;
 constexpr uint16_t DVC_FMA_ISR_UPD = 0x0004;
+constexpr uint16_t DVC_FMA_ISR_UNF = 0x0008;
 constexpr uint16_t DVC_FMA_ISR_DEC = 0x0010;
 constexpr uint16_t DVC_FMA_ISR_POLL = 0x0100;
 
 constexpr uint16_t DVC_FMV_ISR_PIC = 0x0004;
+constexpr uint16_t DVC_FMV_ISR_EOD = 0x0008;
+constexpr uint16_t DVC_FMV_ISR_NDAT = 0x0020;
+constexpr uint16_t DVC_FMV_ISR_DCL = 0x0080;
 constexpr uint16_t DVC_FMV_ISR_TIM = 0x0100;
+constexpr uint16_t DVC_FMV_ISR_ESI = 0x0200;
+constexpr uint16_t DVC_FMV_ISR_EII = 0x0400;
+constexpr uint16_t DVC_FMV_ISR_PAI = 0x1000;
 constexpr uint16_t DVC_FMV_ISR_VCUP = 0x2000;
 
 constexpr uint8_t SCC_DMA_CSR_COC = 0x80;
@@ -117,6 +125,67 @@ int16_t dvc_float_to_sample(float sample)
 {
 	const int value = int(sample * 32767.0f);
 	return int16_t(std::max(-32768, std::min(32767, value)));
+}
+
+uint16_t dvc_reduced_timestamp(int64_t timestamp)
+{
+	return uint16_t((uint64_t(timestamp) >> 7) & 0x7fff);
+}
+
+uint32_t dvc_scan_dma_fallback_bytes(address_space &program, uint32_t memory_address)
+{
+	uint32_t total_bytes = 0;
+
+	for (unsigned int packet = 0; packet < 16 && total_bytes < DVC_DMA_FALLBACK_MAX_BYTES; packet++)
+	{
+		const uint32_t address = (memory_address + total_bytes) & 0x00ffffff;
+		const uint8_t b0 = program.read_byte(address + 0);
+		const uint8_t b1 = program.read_byte(address + 1);
+		const uint8_t b2 = program.read_byte(address + 2);
+		const uint8_t b3 = program.read_byte(address + 3);
+
+		if ((b0 != 0x00) || (b1 != 0x00) || (b2 != 0x01))
+			break;
+
+		uint32_t packet_bytes = 0;
+		if (b3 == 0xba)
+		{
+			// MPEG-1 pack headers are a fixed 12 bytes.
+			packet_bytes = 12;
+		}
+		else if (b3 == 0xb9)
+		{
+			packet_bytes = 4;
+		}
+		else if ((b3 == 0xbb) || (b3 == 0xbd) || ((b3 & 0xf0) == 0xc0) || ((b3 & 0xf0) == 0xe0))
+		{
+			const uint8_t b4 = program.read_byte(address + 4);
+			const uint8_t b5 = program.read_byte(address + 5);
+			packet_bytes = 6 + ((uint32_t(b4) << 8) | uint32_t(b5));
+		}
+		else
+		{
+			break;
+		}
+
+		if (!packet_bytes)
+			break;
+
+		total_bytes += packet_bytes;
+		total_bytes = (total_bytes + 1) & ~1U;
+	}
+
+	if (!total_bytes)
+		total_bytes = 2;
+
+	total_bytes = std::min(total_bytes, DVC_DMA_FALLBACK_MAX_BYTES);
+	return total_bytes;
+}
+
+void dvc_set_bits(uint64_t &value, unsigned start, unsigned width, uint64_t bits)
+{
+	const uint64_t mask = ((uint64_t(1) << width) - 1) << start;
+	value = (value & ~mask) | ((bits << start) & mask);
 }
 } // anonymous namespace
 
@@ -244,6 +313,7 @@ INPUT_PORTS_END
 
 void cdi_state::machine_start()
 {
+	m_dvc_timer = timer_alloc(FUNC(cdi_state::dvc_timer_tick), this);
 	m_dvc_video_timer = timer_alloc(FUNC(cdi_state::dvc_video_tick), this);
 
 	save_item(NAME(m_dvc_fma_command));
@@ -278,6 +348,8 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_fmv_decoder_offset_y));
 	save_item(NAME(m_dvc_fmv_decoder_offset_x));
 	save_item(NAME(m_dvc_fmv_program));
+	save_item(NAME(m_dvc_fmv_demux_timestamp));
+	save_item(NAME(m_dvc_fmv_last_decoded_timestamp));
 	save_item(NAME(m_dvc_image_width));
 	save_item(NAME(m_dvc_image_height));
 	save_item(NAME(m_dvc_image_rt));
@@ -289,13 +361,18 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_video_visible));
 	save_item(NAME(m_dvc_video_show_pending));
 	save_item(NAME(m_dvc_fma_started));
+	save_item(NAME(m_dvc_fma_pending_stream_change));
+	save_item(NAME(m_dvc_fmv_register_update_latch));
+	save_item(NAME(m_dvc_fmv_register_update_scroll));
 	save_item(NAME(m_dvc_mpeg_ram_enabled));
 	save_item(NAME(m_cdic_irq_pending));
 	save_item(NAME(m_dvc_mpeg_ram_enable_count));
+	save_item(NAME(m_dvc_dma_preview_count));
+	save_item(NAME(m_dvc_video_present_accum));
 	save_item(NAME(m_dvc_frame_rate_hz));
 	save_item(NAME(m_dvc_dclk_base));
 
-	machine().save().register_postload(save_prepost_delegate(FUNC(cdi_state::dvc_rebuild_external_video), this));
+	machine().save().register_postload(save_prepost_delegate(FUNC(cdi_state::dvc_restore_state), this));
 }
 
 void cdi_state::machine_reset()
@@ -473,19 +550,84 @@ void quizard_state::mcu_p3_w(uint8_t data)
 *     DVC cartridge      *
 *************************/
 
+void cdi_state::dvc_reset_demux(dvc_demux_state &state)
+{
+	state = dvc_demux_state();
+}
+
+void cdi_state::dvc_restore_state()
+{
+	dvc_rebuild_external_video();
+	dvc_update_irq_timer();
+	dvc_update_video_timer();
+	dvc_update_irq();
+}
+
+void cdi_state::dvc_update_irq_timer()
+{
+	if (!m_dvc_timer)
+		return;
+
+	const uint32_t ticks = (uint32_t(m_dvc_fmv_timer_compare) + 1U) * 8U;
+	const attotime period = attotime::from_ticks(ticks ? ticks : 1U, 45000);
+	m_dvc_timer->adjust(period, 0, period);
+}
+
+void cdi_state::dvc_update_video_timer()
+{
+	if (!m_dvc_playback_active)
+		m_dvc_video_present_accum = 0;
+
+	// Presentation is driven from the FMV timer path below, which tracks the
+	// VMPEG's 90 kHz timing more closely than the old host-timer approximation.
+	if (m_dvc_video_timer)
+		m_dvc_video_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(cdi_state::dvc_timer_tick)
+{
+	dvc_raise_fmv_irq(DVC_FMV_ISR_TIM);
+	if (m_dvc_fma_started)
+		dvc_raise_fma_irq(DVC_FMA_ISR_POLL);
+	if (m_dvc_fmv_register_update_latch && m_dvc_fmv_register_update_scroll)
+	{
+		m_dvc_fmv_register_update_latch = false;
+		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP | DVC_FMV_ISR_DCL);
+	}
+
+	if (m_dvc_playback_active)
+	{
+		const uint32_t frame_period_90khz = std::max<uint32_t>(1U, dvc_frame_period_90khz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
+		const uint32_t tick_90khz = (uint32_t(m_dvc_fmv_timer_compare) + 1U) * 16U;
+		m_dvc_video_present_accum += tick_90khz;
+
+		while (m_dvc_video_present_accum >= frame_period_90khz)
+		{
+			m_dvc_video_present_accum -= frame_period_90khz;
+
+			if (m_dvc_video_queue.empty())
+			{
+				dvc_raise_fmv_irq(DVC_FMV_ISR_NDAT);
+				break;
+			}
+
+			dvc_present_next_frame();
+		}
+	}
+}
+
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_video_tick)
 {
 	if (!m_dvc_playback_active)
 		return;
 
-	dvc_raise_fmv_irq(DVC_FMV_ISR_TIM);
-	if (m_dvc_fma_started)
-		dvc_raise_fma_irq(DVC_FMA_ISR_POLL);
+	if (m_dvc_video_queue.empty())
+	{
+		dvc_raise_fmv_irq(DVC_FMV_ISR_NDAT);
+		return;
+	}
 
 	dvc_present_next_frame();
-
-	if (m_dvc_video_timer && m_dvc_playback_active)
-		m_dvc_video_timer->adjust(attotime::from_hz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
 }
 
 uint8_t cdi_state::dvc_iack_r()
@@ -559,17 +701,22 @@ void cdi_state::dvc_reset()
 	m_dvc_video_visible = false;
 	m_dvc_video_show_pending = false;
 	m_dvc_fma_started = false;
+	m_dvc_fma_pending_stream_change = false;
+	m_dvc_fmv_register_update_latch = false;
+	m_dvc_fmv_register_update_scroll = false;
 	m_dvc_mpeg_ram_enabled = false;
 	m_dvc_mpeg_ram_enable_count = 0;
+	m_dvc_dma_preview_count = 0;
+	m_dvc_video_present_accum = 0;
 	m_dvc_frame_rate_hz = 25.0;
+	m_dvc_fmv_demux_timestamp = 0;
+	m_dvc_fmv_last_decoded_timestamp = 0;
 
 	dvc_reset_video_decoder();
 	dvc_reset_audio_decoder();
 	dvc_rebuild_external_video();
-
-	if (m_dvc_video_timer)
-		m_dvc_video_timer->adjust(attotime::never);
-
+	dvc_update_irq_timer();
+	dvc_update_video_timer();
 	dvc_update_irq();
 }
 
@@ -578,7 +725,7 @@ void cdi_state::dvc_reset_video_decoder()
 	LOGMASKED(LOG_DVC, "%s: DVC reset video decoder\n", machine().describe_context());
 	if (m_dvc_video_plm)
 	{
-		plm_destroy(m_dvc_video_plm);
+		plm_video_destroy(m_dvc_video_plm);
 		m_dvc_video_plm = nullptr;
 		m_dvc_video_buffer = nullptr;
 	}
@@ -589,14 +736,10 @@ void cdi_state::dvc_reset_video_decoder()
 	m_dvc_image_height = 0;
 	m_dvc_image_rt = 0;
 	m_dvc_fmv_video_data_input_command &= ~0x4000;
+	dvc_reset_demux(m_dvc_video_demux_state);
 
 	m_dvc_video_buffer = plm_buffer_create_with_capacity(DVC_PLM_BUFFER_CAPACITY);
-	m_dvc_video_plm = m_dvc_video_buffer ? plm_create_with_buffer(m_dvc_video_buffer, TRUE) : nullptr;
-	if (m_dvc_video_plm)
-	{
-		plm_set_audio_enabled(m_dvc_video_plm, FALSE);
-		plm_set_video_enabled(m_dvc_video_plm, TRUE);
-	}
+	m_dvc_video_plm = m_dvc_video_buffer ? plm_video_create_with_buffer(m_dvc_video_buffer, TRUE) : nullptr;
 }
 
 void cdi_state::dvc_reset_audio_decoder()
@@ -604,19 +747,14 @@ void cdi_state::dvc_reset_audio_decoder()
 	LOGMASKED(LOG_DVC, "%s: DVC reset audio decoder\n", machine().describe_context());
 	if (m_dvc_audio_plm)
 	{
-		plm_destroy(m_dvc_audio_plm);
+		plm_audio_destroy(m_dvc_audio_plm);
 		m_dvc_audio_plm = nullptr;
 		m_dvc_audio_buffer = nullptr;
 	}
 
+	dvc_reset_demux(m_dvc_audio_demux_state);
 	m_dvc_audio_buffer = plm_buffer_create_with_capacity(DVC_PLM_BUFFER_CAPACITY);
-	m_dvc_audio_plm = m_dvc_audio_buffer ? plm_create_with_buffer(m_dvc_audio_buffer, TRUE) : nullptr;
-	if (m_dvc_audio_plm)
-	{
-		plm_set_video_enabled(m_dvc_audio_plm, FALSE);
-		plm_set_audio_enabled(m_dvc_audio_plm, TRUE);
-		plm_set_audio_stream(m_dvc_audio_plm, m_dvc_fma_stream & 0x0003);
-	}
+	m_dvc_audio_plm = m_dvc_audio_buffer ? plm_audio_create_with_buffer(m_dvc_audio_buffer, TRUE) : nullptr;
 }
 
 void cdi_state::dvc_update_irq()
@@ -676,10 +814,7 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	}
 
 	if (data & 0x1000)
-	{
 		m_dvc_decoder_enabled = true;
-		dvc_reset_video_decoder();
-	}
 
 	if (data & 0x8000)
 		dvc_handle_dma_transfer(true);
@@ -688,13 +823,19 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	{
 		m_dvc_playback_active = true;
 		m_dvc_decoder_enabled = true;
+		if (m_dvc_display_frame.pixels.empty() && !m_dvc_video_queue.empty())
+			dvc_present_next_frame();
 	}
 
 	if (data & 0x0010)
 		m_dvc_playback_active = false;
 
 	if (data & 0x0020)
+	{
 		m_dvc_playback_active = true;
+		if (m_dvc_display_frame.pixels.empty() && !m_dvc_video_queue.empty())
+			dvc_present_next_frame();
+	}
 
 	if (data & 0x0040)
 	{
@@ -705,13 +846,7 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	if (data & 0x0080)
 		m_dvc_playback_active = false;
 
-	if (m_dvc_video_timer)
-	{
-		if (m_dvc_playback_active)
-			m_dvc_video_timer->adjust(attotime::from_hz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
-		else
-			m_dvc_video_timer->adjust(attotime::never);
-	}
+	dvc_update_video_timer();
 }
 
 void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
@@ -745,8 +880,8 @@ void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
 
 	if (data & 0x0008)
 	{
-		dvc_rebuild_external_video();
-		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP);
+		m_dvc_fmv_register_update_latch = true;
+		m_dvc_fmv_register_update_scroll = BIT(data, 2);
 	}
 }
 
@@ -778,12 +913,14 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 {
 	auto &dma = m_maincpu->dma().channel[1];
 	address_space &program = m_maincpu->space(AS_PROGRAM);
-	LOGMASKED(LOG_DVC, "%s: DVC DMA %s mac=%06x dac=%06x count=%04x seq=%02x\n",
+	uint32_t transfer_words = uint32_t(dma.transfer_counter) + 1;
+	LOGMASKED(LOG_DVC, "%s: DVC DMA %s mac=%06x dac=%06x count=%04x words=%u seq=%02x\n",
 		machine().describe_context(),
 		video ? "video" : "audio",
 		dma.memory_address_counter & 0x00fffffe,
 		dma.device_address_counter,
 		dma.transfer_counter,
+		transfer_words,
 		dma.sequence_control);
 
 	uint32_t memory_address = dma.memory_address_counter & 0x00fffffe;
@@ -791,7 +928,47 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 	const bool increment_memory = (dma.sequence_control & SCC_DMA_SEQ_MAC_INC) != 0;
 	const bool increment_device = (dma.sequence_control & SCC_DMA_SEQ_DAC_INC) != 0;
 
-	for (uint32_t remaining = dma.transfer_counter; remaining > 0; remaining--)
+	if (video && (m_dvc_fmv_interrupt_status & DVC_FMV_ISR_NDAT))
+	{
+		m_dvc_fmv_interrupt_status &= ~DVC_FMV_ISR_NDAT;
+		dvc_update_irq();
+	}
+
+	if (video && m_dvc_dma_preview_count < 16)
+	{
+		const uint16_t w0 = program.read_word((memory_address + 0x0) & 0x00fffffe);
+		const uint16_t w1 = program.read_word((memory_address + 0x2) & 0x00fffffe);
+		const uint16_t w2 = program.read_word((memory_address + 0x4) & 0x00fffffe);
+		const uint16_t w3 = program.read_word((memory_address + 0x6) & 0x00fffffe);
+		const uint16_t w4 = program.read_word((memory_address + 0x8) & 0x00fffffe);
+		const uint16_t w5 = program.read_word((memory_address + 0xa) & 0x00fffffe);
+		const uint16_t w6 = program.read_word((memory_address + 0xc) & 0x00fffffe);
+		const uint16_t w7 = program.read_word((memory_address + 0xe) & 0x00fffffe);
+		LOGMASKED(LOG_DVC, "%s: DVC DMA preview mac=%06x [%04x %04x %04x %04x %04x %04x %04x %04x]\n",
+			machine().describe_context(),
+			memory_address,
+			w0, w1, w2, w3, w4, w5, w6, w7);
+		m_dvc_dma_preview_count++;
+	}
+
+	// The MCD251 docs describe a DMA request/ack FIFO path, and MiSTer keeps
+	// VMPEG requesting until the transfer completes. MAME's SCC68070 model
+	// currently leaves VMPEG DMA bursts at a visible count of 0, so fall back
+	// to pulling one contiguous MPEG packet span from RAM when that happens.
+	if ((dma.transfer_counter == 0) && increment_memory && !increment_device)
+	{
+		const uint32_t fallback_bytes = dvc_scan_dma_fallback_bytes(program, memory_address);
+		transfer_words = fallback_bytes / 2;
+		LOGMASKED(LOG_DVC, "%s: DVC DMA %s using zero-count fallback bytes=%u words=%u\n",
+			machine().describe_context(),
+			video ? "video" : "audio",
+			fallback_bytes,
+			transfer_words);
+	}
+
+	// MiSTer's SCC68070 DMA engine treats the transfer counter as "remaining words - 1",
+	// so a count of 0 still performs one final 16-bit transfer before completion.
+	for (uint32_t remaining = transfer_words; remaining > 0; remaining--)
 	{
 		dvc_feed_word(video, program.read_word(memory_address));
 
@@ -825,11 +1002,288 @@ void cdi_state::dvc_feed_bytes(bool video, const uint8_t *data, size_t bytes)
 	if (!video && !m_dvc_audio_plm)
 		dvc_reset_audio_decoder();
 
-	plm_buffer_t *const buffer = video ? m_dvc_video_buffer : m_dvc_audio_buffer;
-	if (!buffer || !data || !bytes)
+	if (!data || !bytes)
 		return;
 
-	plm_buffer_write(buffer, const_cast<uint8_t *>(data), bytes);
+	for (size_t index = 0; index < bytes; index++)
+		dvc_process_demux_byte(video, data[index]);
+}
+
+void cdi_state::dvc_process_demux_byte(bool video, uint8_t data)
+{
+	dvc_demux_state &demux = video ? m_dvc_video_demux_state : m_dvc_audio_demux_state;
+	plm_buffer_t *const decoder_buffer = video ? m_dvc_video_buffer : m_dvc_audio_buffer;
+	const uint8_t stream_filter = video ? (m_dvc_fmv_stream & 0x0f) : (m_dvc_fma_stream & 0x0f);
+	const uint32_t dclk = video ? 0 : m_dvc_fma_dclk;
+	const bool packet_body = demux.packet_body;
+	const bool end_of_packet = demux.packet_length_decreasing && (demux.packet_length == 1);
+
+	demux.decoding_timestamp_updated = false;
+	demux.event_program_end = false;
+	if (demux.packet_length_decreasing && demux.packet_length)
+		demux.packet_length--;
+
+	switch (demux.phase)
+	{
+	case dvc_demux_state::PACK5:
+		demux.phase = dvc_demux_state::IDLE;
+		LOGMASKED(LOG_DVC, "%s: DVC %s pack scr=%08x\n",
+			machine().describe_context(),
+			video ? "FMV" : "FMA",
+			uint32_t(demux.system_clock_reference));
+		break;
+
+	case dvc_demux_state::PACK4:
+		demux.phase = dvc_demux_state::PACK5;
+		dvc_set_bits(demux.system_clock_reference, 0, 7, data >> 1);
+		break;
+
+	case dvc_demux_state::PACK3:
+		demux.phase = dvc_demux_state::PACK4;
+		dvc_set_bits(demux.system_clock_reference, 7, 8, data);
+		break;
+
+	case dvc_demux_state::PACK2:
+		demux.phase = dvc_demux_state::PACK3;
+		dvc_set_bits(demux.system_clock_reference, 15, 7, data >> 1);
+		break;
+
+	case dvc_demux_state::PACK1:
+		demux.phase = dvc_demux_state::PACK2;
+		dvc_set_bits(demux.system_clock_reference, 22, 8, data);
+		break;
+
+	case dvc_demux_state::PACK0:
+		demux.phase = dvc_demux_state::PACK1;
+		dvc_set_bits(demux.system_clock_reference, 30, 3, data >> 1);
+		break;
+
+	case dvc_demux_state::PES8:
+		demux.phase = dvc_demux_state::IDLE;
+		demux.decoding_timestamp = demux.dts_present ? int64_t(demux.decoding_timestamp_temp) : int64_t(demux.presentation_timestamp);
+		demux.decoding_timestamp_updated = true;
+		if (!demux.system_clock_reference_start_time_valid)
+		{
+			demux.system_clock_reference_start_time_valid = true;
+			demux.system_clock_reference_start_time = int64_t(dclk) + int64_t(demux.presentation_timestamp >> 1) - int64_t(demux.system_clock_reference >> 1);
+		}
+		LOGMASKED(LOG_DVC, "%s: DVC demux %s timestamp=%04x stream=%x\n",
+			machine().describe_context(),
+			video ? "FMV" : "FMA",
+			dvc_reduced_timestamp(demux.decoding_timestamp),
+			stream_filter);
+		break;
+
+	case dvc_demux_state::PES_DTS4:
+		if (BIT(data, 0))
+		{
+			dvc_set_bits(demux.decoding_timestamp_temp, 0, 7, data >> 1);
+			demux.packet_body = true;
+			demux.phase = dvc_demux_state::PES8;
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::PES_DTS3:
+		demux.phase = dvc_demux_state::PES_DTS4;
+		dvc_set_bits(demux.decoding_timestamp_temp, 7, 8, data);
+		break;
+
+	case dvc_demux_state::PES_DTS2:
+		if (BIT(data, 0))
+		{
+			demux.phase = dvc_demux_state::PES_DTS3;
+			dvc_set_bits(demux.decoding_timestamp_temp, 15, 7, data >> 1);
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::PES_DTS1:
+		demux.phase = dvc_demux_state::PES_DTS2;
+		dvc_set_bits(demux.decoding_timestamp_temp, 22, 8, data);
+		break;
+
+	case dvc_demux_state::PES_DTS0:
+		if ((data & 0xf1) == 0x11)
+		{
+			demux.phase = dvc_demux_state::PES_DTS1;
+			dvc_set_bits(demux.decoding_timestamp_temp, 30, 3, data >> 1);
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::PES7:
+		if (BIT(data, 0))
+		{
+			dvc_set_bits(demux.presentation_timestamp, 0, 7, data >> 1);
+			if (demux.dts_present)
+			{
+				demux.phase = dvc_demux_state::PES_DTS0;
+			}
+			else
+			{
+				demux.packet_body = true;
+				demux.phase = dvc_demux_state::PES8;
+			}
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::PES6:
+		demux.phase = dvc_demux_state::PES7;
+		dvc_set_bits(demux.presentation_timestamp, 7, 8, data);
+		break;
+
+	case dvc_demux_state::PES5:
+		if (BIT(data, 0))
+		{
+			demux.phase = dvc_demux_state::PES6;
+			dvc_set_bits(demux.presentation_timestamp, 15, 7, data >> 1);
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::PES4:
+		demux.phase = dvc_demux_state::PES5;
+		dvc_set_bits(demux.presentation_timestamp, 22, 8, data);
+		break;
+
+	case dvc_demux_state::PES3:
+		demux.phase = dvc_demux_state::PES2;
+		break;
+
+	case dvc_demux_state::PES2:
+		if ((data & 0xf1) == 0x21)
+		{
+			dvc_set_bits(demux.presentation_timestamp, 30, 3, data >> 1);
+			demux.dts_present = false;
+			demux.phase = dvc_demux_state::PES4;
+		}
+		else if ((data & 0xf1) == 0x31)
+		{
+			dvc_set_bits(demux.presentation_timestamp, 30, 3, data >> 1);
+			demux.dts_present = true;
+			demux.phase = dvc_demux_state::PES4;
+		}
+		else if (data == 0x0f)
+		{
+			demux.packet_body = true;
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		else if ((data & 0xc0) == 0x40)
+		{
+			demux.phase = dvc_demux_state::PES3;
+		}
+		else if (data == 0xff)
+		{
+			demux.phase = dvc_demux_state::PES2;
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::PES1:
+		demux.phase = dvc_demux_state::PES2;
+		demux.packet_length = (demux.packet_length & 0xff00) | data;
+		demux.packet_length_decreasing = true;
+		break;
+
+	case dvc_demux_state::PES0:
+		demux.phase = dvc_demux_state::PES1;
+		demux.packet_length = (demux.packet_length & 0x00ff) | (uint16_t(data) << 8);
+		break;
+
+	case dvc_demux_state::MAGIC_MATCH:
+		if (data == 0xba)
+		{
+			demux.phase = dvc_demux_state::PACK0;
+		}
+		else if ((data & 0xf0) == 0xc0)
+		{
+			if ((data & 0x0f) == stream_filter)
+				demux.phase = dvc_demux_state::PES0;
+		}
+		else if ((data & 0xf0) == 0xe0)
+		{
+			if ((data & 0x0f) == stream_filter)
+				demux.phase = dvc_demux_state::PES0;
+		}
+		else if (data == 0xb9)
+		{
+			demux.event_program_end = true;
+			demux.phase = dvc_demux_state::IDLE;
+			LOGMASKED(LOG_DVC, "%s: DVC demux %s program end\n",
+				machine().describe_context(),
+				video ? "FMV" : "FMA");
+		}
+		else
+		{
+			demux.phase = dvc_demux_state::IDLE;
+		}
+		break;
+
+	case dvc_demux_state::MAGIC2:
+		if (data == 0x01)
+			demux.phase = dvc_demux_state::MAGIC_MATCH;
+		else if (data == 0x00)
+			demux.phase = dvc_demux_state::MAGIC2;
+		else
+			demux.phase = dvc_demux_state::IDLE;
+		break;
+
+	case dvc_demux_state::MAGIC0:
+		demux.phase = (data == 0x00) ? dvc_demux_state::MAGIC2 : dvc_demux_state::IDLE;
+		break;
+
+	case dvc_demux_state::IDLE:
+	default:
+		if (!packet_body && data == 0x00)
+			demux.phase = dvc_demux_state::MAGIC0;
+		else
+			demux.phase = dvc_demux_state::IDLE;
+		break;
+	}
+
+	if (end_of_packet)
+	{
+		demux.packet_length_decreasing = false;
+		demux.packet_body = false;
+	}
+
+	if (packet_body && decoder_buffer)
+		plm_buffer_write(decoder_buffer, &data, 1);
+
+	if (video && demux.decoding_timestamp_updated)
+		m_dvc_fmv_demux_timestamp = dvc_reduced_timestamp(demux.decoding_timestamp);
+	if (demux.event_program_end)
+	{
+		if (video)
+		{
+			dvc_raise_fmv_irq(DVC_FMV_ISR_EII);
+		}
+		else
+		{
+			m_dvc_fma_status |= 0x01;
+			dvc_raise_fma_irq(DVC_FMA_ISR_EOI);
+		}
+	}
 }
 
 void cdi_state::dvc_decode_video()
@@ -837,7 +1291,10 @@ void cdi_state::dvc_decode_video()
 	if (!m_dvc_video_plm)
 		return;
 
-	if (const double rate_hz = plm_get_framerate(m_dvc_video_plm); rate_hz > 0.0)
+	const size_t buffered_before = m_dvc_video_buffer ? plm_buffer_get_remaining(m_dvc_video_buffer) : 0;
+	bool decoded_any = false;
+
+	if (const double rate_hz = plm_video_get_framerate(m_dvc_video_plm); rate_hz > 0.0)
 	{
 		m_dvc_frame_rate_hz = rate_hz;
 		m_dvc_image_rt = dvc_rate_code(rate_hz);
@@ -845,7 +1302,7 @@ void cdi_state::dvc_decode_video()
 
 	while (m_dvc_video_queue.size() < 8)
 	{
-		plm_frame_t *const frame = plm_decode_video(m_dvc_video_plm);
+		plm_frame_t *const frame = plm_video_decode(m_dvc_video_plm);
 		if (!frame)
 			break;
 
@@ -866,12 +1323,28 @@ void cdi_state::dvc_decode_video()
 
 		m_dvc_image_width = frame->width;
 		m_dvc_image_height = frame->height;
+		m_dvc_fmv_last_decoded_timestamp = m_dvc_fmv_demux_timestamp;
 		m_dvc_fmv_video_data_input_command |= 0x4000;
 		m_dvc_video_queue.push_back(std::move(queued));
+		decoded_any = true;
 	}
 
-	if (m_dvc_playback_active && m_dvc_video_timer)
-		m_dvc_video_timer->adjust(attotime::from_hz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
+	if (decoded_any)
+	{
+		m_dvc_fmv_interrupt_status &= ~DVC_FMV_ISR_NDAT;
+		dvc_update_irq();
+	}
+	else if (m_dvc_decoder_enabled && m_dvc_video_queue.empty())
+	{
+		const size_t buffered_after = m_dvc_video_buffer ? plm_buffer_get_remaining(m_dvc_video_buffer) : 0;
+		LOGMASKED(LOG_DVC, "%s: DVC FMV needs more data buffered_before=%u buffered_after=%u\n",
+			machine().describe_context(),
+			unsigned(buffered_before),
+			unsigned(buffered_after));
+		dvc_raise_fmv_irq(DVC_FMV_ISR_NDAT);
+	}
+
+	dvc_update_video_timer();
 }
 
 void cdi_state::dvc_decode_audio()
@@ -879,7 +1352,7 @@ void cdi_state::dvc_decode_audio()
 	if (!m_dvc_audio_plm)
 		return;
 
-	if (const int sample_rate = plm_get_samplerate(m_dvc_audio_plm); sample_rate > 0)
+	if (const int sample_rate = plm_audio_get_samplerate(m_dvc_audio_plm); sample_rate > 0)
 	{
 		m_dmadac[0]->enable(1);
 		m_dmadac[0]->set_frequency(sample_rate);
@@ -892,7 +1365,7 @@ void cdi_state::dvc_decode_audio()
 	bool decoded_any = false;
 	for (;;)
 	{
-		plm_samples_t *const samples = plm_decode_audio(m_dvc_audio_plm);
+		plm_samples_t *const samples = plm_audio_decode(m_dvc_audio_plm);
 		if (!samples)
 			break;
 
@@ -920,8 +1393,14 @@ void cdi_state::dvc_decode_audio()
 
 		m_dvc_fma_status |= 0x04;
 		dvc_raise_fma_irq(DVC_FMA_ISR_UPD);
+		if (m_dvc_fma_pending_stream_change)
+		{
+			m_dvc_fma_pending_stream_change = false;
+			m_dvc_fma_status |= 0x02;
+			dvc_raise_fma_irq(DVC_FMA_ISR_CSU);
+		}
 	}
-	else if (m_dvc_fma_started && plm_has_ended(m_dvc_audio_plm))
+	else if (m_dvc_fma_started && plm_audio_has_ended(m_dvc_audio_plm))
 	{
 		m_dvc_fma_status |= 0x01;
 		dvc_raise_fma_irq(DVC_FMA_ISR_EOI);
@@ -946,6 +1425,11 @@ void cdi_state::dvc_present_next_frame()
 	{
 		m_dvc_video_show_pending = false;
 		m_dvc_video_visible = true;
+	}
+	if (m_dvc_fmv_register_update_latch && !m_dvc_fmv_register_update_scroll)
+	{
+		m_dvc_fmv_register_update_latch = false;
+		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP | DVC_FMV_ISR_DCL);
 	}
 
 	dvc_rebuild_external_video();
@@ -1074,13 +1558,17 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 	case 0x407a: data = m_dvc_fmv_window_width; break;
 	case 0x407c: data = m_dvc_fmv_decoder_offset_y; break;
 	case 0x407e: data = m_dvc_fmv_decoder_offset_x; break;
-	case 0x4088: data = m_dvc_fmv_decoder_command; break;
+	case 0x4088:
+		data = m_dvc_fmv_decoder_command;
+		if (m_dvc_decoder_enabled)
+			data |= 0x0042;
+		break;
 	case 0x408c: data = m_dvc_fmv_video_data_input_command; break;
 	case 0x40da: data = m_dvc_fmv_program; break;
 	case 0x4098: data = current_dclk >> 6; break;
 	case 0x409c: data = 0; break;
 	case 0x409e: data = 0xfe96; break;
-	case 0x40a0: data = 0; break;
+	case 0x40a0: data = m_dvc_fmv_last_decoded_timestamp; break;
 	case 0x40a4: data = uint16_t(std::min<size_t>(31, m_dvc_video_queue.size())); break;
 	case 0x40a8: data = dvc_frame_period_90khz(m_dvc_frame_rate_hz); break;
 	case 0x40aa: data = dvc_frame_period_90khz(m_dvc_frame_rate_hz); break;
@@ -1127,10 +1615,7 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	case 0x300a:
 		COMBINE_DATA(&m_dvc_fma_stream);
 		m_dvc_fma_stream &= 0x000f;
-		if (m_dvc_audio_plm)
-			plm_set_audio_stream(m_dvc_audio_plm, m_dvc_fma_stream & 0x0003);
-		m_dvc_fma_status |= 0x02;
-		dvc_raise_fma_irq(DVC_FMA_ISR_CSU);
+		m_dvc_fma_pending_stream_change = true;
 		break;
 
 	case 0x300c:
@@ -1161,7 +1646,13 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		COMBINE_DATA(&m_dvc_fmv_interrupt_enable);
 		dvc_update_irq();
 		break;
-	case 0x4064: COMBINE_DATA(&m_dvc_fmv_timer_compare); break;
+	case 0x4064:
+		COMBINE_DATA(&m_dvc_fmv_timer_compare);
+		dvc_update_irq_timer();
+		break;
+	case 0x40ae:
+		dvc_update_irq_timer();
+		break;
 	case 0x406c: COMBINE_DATA(&m_dvc_fmv_y_offset); break;
 	case 0x406e: COMBINE_DATA(&m_dvc_fmv_x_offset); break;
 	case 0x4070: COMBINE_DATA(&m_dvc_fmv_y_active); break;

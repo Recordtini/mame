@@ -18,8 +18,9 @@
 #include <deque>
 #include <vector>
 
-struct plm_t;
 struct plm_buffer_t;
+struct plm_video_t;
+struct plm_audio_t;
 
 /*----------- driver state -----------*/
 
@@ -53,6 +54,51 @@ protected:
 		uint16_t width = 0;
 		uint16_t height = 0;
 		std::vector<uint32_t> pixels;
+	};
+
+	struct dvc_demux_state
+	{
+		enum phase_t : uint8_t
+		{
+			IDLE,
+			MAGIC0,
+			MAGIC2,
+			MAGIC_MATCH,
+			PACK0,
+			PACK1,
+			PACK2,
+			PACK3,
+			PACK4,
+			PACK5,
+			PES0,
+			PES1,
+			PES2,
+			PES3,
+			PES4,
+			PES5,
+			PES6,
+			PES7,
+			PES8,
+			PES_DTS0,
+			PES_DTS1,
+			PES_DTS2,
+			PES_DTS3,
+			PES_DTS4
+		};
+
+		phase_t phase = IDLE;
+		bool packet_length_decreasing = false;
+		bool packet_body = false;
+		bool dts_present = false;
+		bool decoding_timestamp_updated = false;
+		bool system_clock_reference_start_time_valid = false;
+		bool event_program_end = false;
+		uint16_t packet_length = 0;
+		uint64_t system_clock_reference = 0;
+		uint64_t presentation_timestamp = 0;
+		uint64_t decoding_timestamp_temp = 0;
+		int64_t decoding_timestamp = 0;
+		int64_t system_clock_reference_start_time = 0;
 	};
 
 	enum servo_portc_bit_t
@@ -100,6 +146,7 @@ protected:
 	void bus_error_w(offs_t offset, uint16_t data);
 	void cdic_dvc_irq_w(int state);
 
+	TIMER_CALLBACK_MEMBER(dvc_timer_tick);
 	TIMER_CALLBACK_MEMBER(dvc_video_tick);
 
 	uint8_t cdimono1_iack4_r();
@@ -107,7 +154,11 @@ protected:
 	void dvc_reset();
 	void dvc_reset_video_decoder();
 	void dvc_reset_audio_decoder();
+	void dvc_reset_demux(dvc_demux_state &state);
+	void dvc_restore_state();
 	void dvc_update_irq();
+	void dvc_update_irq_timer();
+	void dvc_update_video_timer();
 	void dvc_raise_fmv_irq(uint16_t bits);
 	void dvc_raise_fma_irq(uint16_t bits);
 	void dvc_handle_fmv_command(uint16_t data);
@@ -116,19 +167,23 @@ protected:
 	void dvc_handle_dma_transfer(bool video);
 	void dvc_feed_word(bool video, uint16_t data);
 	void dvc_feed_bytes(bool video, const uint8_t *data, size_t bytes);
+	void dvc_process_demux_byte(bool video, uint8_t data);
 	void dvc_decode_video();
 	void dvc_decode_audio();
 	void dvc_present_next_frame();
 	void dvc_rebuild_external_video();
 
-	plm_t *m_dvc_video_plm = nullptr;
+	dvc_demux_state m_dvc_video_demux_state;
+	plm_video_t *m_dvc_video_plm = nullptr;
 	plm_buffer_t *m_dvc_video_buffer = nullptr;
-	plm_t *m_dvc_audio_plm = nullptr;
+	dvc_demux_state m_dvc_audio_demux_state;
+	plm_audio_t *m_dvc_audio_plm = nullptr;
 	plm_buffer_t *m_dvc_audio_buffer = nullptr;
 
 	std::deque<dvc_video_frame> m_dvc_video_queue;
 	dvc_video_frame m_dvc_display_frame;
 
+	emu_timer *m_dvc_timer = nullptr;
 	emu_timer *m_dvc_video_timer = nullptr;
 
 	uint16_t m_dvc_fma_command = 0;
@@ -163,6 +218,8 @@ protected:
 	uint16_t m_dvc_fmv_decoder_offset_y = 0;
 	uint16_t m_dvc_fmv_decoder_offset_x = 0;
 	uint16_t m_dvc_fmv_program = 0;
+	uint16_t m_dvc_fmv_demux_timestamp = 0;
+	uint16_t m_dvc_fmv_last_decoded_timestamp = 0;
 	uint16_t m_dvc_image_width = 0;
 	uint16_t m_dvc_image_height = 0;
 	uint16_t m_dvc_image_rt = 0;
@@ -174,9 +231,14 @@ protected:
 	bool m_dvc_video_visible = false;
 	bool m_dvc_video_show_pending = false;
 	bool m_dvc_fma_started = false;
+	bool m_dvc_fma_pending_stream_change = false;
+	bool m_dvc_fmv_register_update_latch = false;
+	bool m_dvc_fmv_register_update_scroll = false;
 	bool m_dvc_mpeg_ram_enabled = false;
 	bool m_cdic_irq_pending = false;
 	uint8_t m_dvc_mpeg_ram_enable_count = 0;
+	uint8_t m_dvc_dma_preview_count = 0;
+	uint32_t m_dvc_video_present_accum = 0;
 	double m_dvc_frame_rate_hz = 25.0;
 	u64 m_dvc_dclk_base = 0;
 };

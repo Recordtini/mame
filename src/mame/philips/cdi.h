@@ -40,7 +40,7 @@ public:
 		, m_cdic(*this, "cdic")
 		, m_cdrom(*this, "cdrom")
 		, m_mcd212(*this, "mcd212")
-		, m_dmadac(*this, "dac%u", 1U)
+		, m_dmadac(*this, "dvc_dac%u", 1U)
 	{ }
 
 	void cdimono1_base(machine_config &config);
@@ -148,6 +148,7 @@ protected:
 
 	TIMER_CALLBACK_MEMBER(dvc_timer_tick);
 	TIMER_CALLBACK_MEMBER(dvc_video_tick);
+	TIMER_CALLBACK_MEMBER(dvc_audio_tick);
 
 	uint8_t cdimono1_iack4_r();
 	uint8_t dvc_iack_r();
@@ -159,6 +160,7 @@ protected:
 	void dvc_update_irq();
 	void dvc_update_irq_timer();
 	void dvc_update_video_timer();
+	void dvc_update_audio_timer();
 	void dvc_raise_fmv_irq(uint16_t bits);
 	void dvc_raise_fma_irq(uint16_t bits);
 	void dvc_handle_fmv_command(uint16_t data);
@@ -182,9 +184,11 @@ protected:
 
 	std::deque<dvc_video_frame> m_dvc_video_queue;
 	dvc_video_frame m_dvc_display_frame;
+	std::deque<int16_t> m_dvc_audio_pcm[2];
 
 	emu_timer *m_dvc_timer = nullptr;
 	emu_timer *m_dvc_video_timer = nullptr;
+	emu_timer *m_dvc_audio_timer = nullptr;
 
 	uint16_t m_dvc_fma_command = 0;
 	uint8_t m_dvc_fma_status = 0;
@@ -232,13 +236,17 @@ protected:
 	bool m_dvc_video_show_pending = false;
 	bool m_dvc_fma_started = false;
 	bool m_dvc_fma_pending_stream_change = false;
+	bool m_dvc_audio_output_active = false;
 	bool m_dvc_fmv_register_update_latch = false;
 	bool m_dvc_fmv_register_update_scroll = false;
 	bool m_dvc_mpeg_ram_enabled = false;
 	bool m_cdic_irq_pending = false;
+	int16_t m_dvc_audio_output_level[2] = { 0, 0 };
 	uint8_t m_dvc_mpeg_ram_enable_count = 0;
 	uint8_t m_dvc_dma_preview_count = 0;
+	uint8_t m_dvc_audio_empty_ticks = 0;
 	uint32_t m_dvc_video_present_accum = 0;
+	uint32_t m_dvc_audio_sample_rate = 0;
 	double m_dvc_frame_rate_hz = 25.0;
 	u64 m_dvc_dclk_base = 0;
 };

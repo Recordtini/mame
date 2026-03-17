@@ -59,6 +59,7 @@ public:
 
 private:
 	struct limit_hit {};
+	struct invalid_header {};
 
 	struct band_info {
 		int modulo;

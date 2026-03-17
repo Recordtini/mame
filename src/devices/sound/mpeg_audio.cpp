@@ -34,93 +34,96 @@ void mpeg_audio::clear()
 bool mpeg_audio::decode_buffer(int &pos, int limit, short *output,
 								int &output_samples, int &sample_rate, int &channels, int atbl)
 {
-	if(limit - pos < 16)
-		return false;
-
-	// Scan for the sync mark
-	//
-	// Avoid the exception dance at the point where going out of bound
-	// is the most probable and easily avoidable
-
-	current_pos = pos;
-	current_limit = limit;
-	cbr_param_index = atbl;
-	unsigned short sync = do_gb(base, current_pos, 12);
-
-	retry_sync:
-	while(sync != 0xfff && current_pos < limit)
-		sync = ((sync << 1) | do_gb(base, current_pos, 1)) & 0xfff;
-
-	if(limit - current_pos < 4)
-		return false;
-
-	int layer = 0;
-	int variant = do_gb(base, current_pos, 3);
-	switch(variant) {
-	case 2:
-		if(accepted & L2_5)
-			layer = 2;
-		else if(accepted & AMM)
-			layer = 4;
-		break;
-
-	case 5:
-		if(accepted & L3)
-			layer = 3;
-		break;
-
-	case 6:
-		if(accepted & (L2|L2_5))
-			layer = 2;
-		else if(accepted & AMM)
-			layer = 4;
-		break;
-
-	case 7:
-		if(accepted & L1)
-			layer = 1;
-		break;
-	}
-
-	if(!layer) {
-		current_pos -= 3;
-		sync = ((sync << 1) | do_gb(base, current_pos, 1)) & 0xfff;
-		goto retry_sync;
-	}
-
-	switch(layer) {
-	case 1:
-		abort();
-	case 2:
-		try {
-			read_header_mpeg2(variant == 2);
-			read_data_mpeg2();
-			decode_mpeg2(output, output_samples);
-		} catch(limit_hit) {
-			return false;
-		}
-		break;
-	case 3:
-		abort();
-	case 4:
-		try {
-			read_header_amm(variant == 2);
-			read_data_mpeg2();
-			if(last_frame_number)
-				decode_mpeg2(output, output_samples);
-		} catch(limit_hit) {
-			return false;
-		}
-		break;
-	}
+	const int search_step = position_align ? (position_align + 1) : 1;
+	int search_pos = pos;
 
 	if(position_align)
-		current_pos = (current_pos + position_align) & ~position_align;
+		search_pos = (search_pos + position_align) & ~position_align;
 
-	pos = current_pos;
-	sample_rate = sample_rates[sampling_rate];
-	channels = channel_count;
-	return true;
+	if(limit - search_pos < 16)
+		return false;
+
+	while(limit - search_pos >= 16) {
+		current_pos = search_pos;
+		current_limit = limit;
+		cbr_param_index = atbl;
+
+		if(do_gb(base, current_pos, 12) != 0xfff) {
+			search_pos += search_step;
+			continue;
+		}
+
+		if(limit - current_pos < 4)
+			return false;
+
+		int layer = 0;
+		int variant = do_gb(base, current_pos, 3);
+		switch(variant) {
+		case 2:
+			if(accepted & L2_5)
+				layer = 2;
+			else if(accepted & AMM)
+				layer = 4;
+			break;
+
+		case 5:
+			if(accepted & L3)
+				layer = 3;
+			break;
+
+		case 6:
+			if(accepted & (L2|L2_5))
+				layer = 2;
+			else if(accepted & AMM)
+				layer = 4;
+			break;
+
+		case 7:
+			if(accepted & L1)
+				layer = 1;
+			break;
+		}
+
+		if(!layer) {
+			search_pos += search_step;
+			continue;
+		}
+
+		try {
+			switch(layer) {
+			case 1:
+				abort();
+			case 2:
+				read_header_mpeg2(variant == 2);
+				read_data_mpeg2();
+				decode_mpeg2(output, output_samples);
+				break;
+			case 3:
+				abort();
+			case 4:
+				read_header_amm(variant == 2);
+				read_data_mpeg2();
+				if(last_frame_number)
+					decode_mpeg2(output, output_samples);
+				break;
+			}
+		} catch(limit_hit) {
+			return false;
+		} catch(invalid_header) {
+			search_pos += search_step;
+			continue;
+		}
+
+		if(position_align)
+			current_pos = (current_pos + position_align) & ~position_align;
+
+		pos = current_pos;
+		sample_rate = sample_rates[sampling_rate];
+		channels = channel_count;
+		return true;
+	}
+
+	return false;
 }
 
 void mpeg_audio::read_header_amm(bool layer25)
@@ -145,12 +148,23 @@ void mpeg_audio::read_header_amm(bool layer25)
 	}
 	gb(1); // must be zero
 
+	if (sampling_rate < 0 || sampling_rate >= 8 || sample_rates[sampling_rate] == 0)
+		throw invalid_header();
+	if (param_index < 0 || param_index >= 5)
+		throw invalid_header();
+
 	channel_count = stereo_mode != 3 ? 2 : 1;
 
 	total_bands = total_band_counts[param_index];
 	joint_bands = total_bands;
 	if(stereo_mode == 1) // joint stereo
 		joint_bands = joint_band_counts[stereo_mode_ext];
+	if (channel_count < 1 || channel_count > 2)
+		throw invalid_header();
+	if (total_bands < 0 || total_bands > 32)
+		throw invalid_header();
+	if (joint_bands < 0)
+		throw invalid_header();
 	if(joint_bands > total_bands )
 		joint_bands = total_bands;
 }
@@ -173,12 +187,19 @@ void mpeg_audio::read_header_mpeg2(bool layer25)
 	channel_count = stereo_mode != 3 ? 2 : 1;
 
 	param_index = layer2_param_index[channel_count-1][sampling_rate][bitrate_index];
-	assert(param_index != -1);
+	if (sample_rates[sampling_rate] == 0 || param_index == -1)
+		throw invalid_header();
 
 	total_bands = total_band_counts[param_index];
 	joint_bands = total_bands;
 	if(stereo_mode == 1) // joint stereo
 		joint_bands = joint_band_counts[stereo_mode_ext];
+	if (channel_count < 1 || channel_count > 2)
+		throw invalid_header();
+	if (total_bands < 0 || total_bands > 32)
+		throw invalid_header();
+	if (joint_bands < 0)
+		throw invalid_header();
 	if(joint_bands > total_bands )
 		joint_bands = total_bands;
 }
@@ -559,8 +580,18 @@ int mpeg_audio::do_gb_lsb(const unsigned char *data, int &pos, int count)
 int mpeg_audio::get_band_param(int band)
 {
 	int bit_count = band_parameter_index_bits_count[param_index][band];
+	if (bit_count < 0 || bit_count > 4)
+		throw invalid_header();
+
 	int index = gb(bit_count);
-	return band_parameter_indexed_values[param_index][band][index];
+	if (index < 0 || index >= 17)
+		throw invalid_header();
+
+	const int value = band_parameter_indexed_values[param_index][band][index];
+	if (value < 0 || value >= 18)
+		throw invalid_header();
+
+	return value;
 }
 
 void mpeg_audio::read_band_params()
@@ -702,7 +733,7 @@ void mpeg_audio::build_next_segments(int step)
 		band++;
 	}
 
-	while(band < joint_bands) {
+	while(band < total_bands) {
 		read_band_value_triplet(0, band);
 		bdata[1][0][band] = bdata[0][0][band];
 		bdata[1][1][band] = bdata[0][1][band];

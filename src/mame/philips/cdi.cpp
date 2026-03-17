@@ -57,6 +57,7 @@ TODO:
 #include "imagedev/cdromimg.h"
 #include "machine/timekpr.h"
 #include "sound/cdda.h"
+#include "sound/mpeg_audio.h"
 
 #include "emupal.h"
 #include "screen.h"
@@ -73,7 +74,8 @@ namespace
 {
 constexpr uint32_t DVC_VMPEG_ROM_BASE = 0xe40000;
 constexpr uint32_t DVC_VMPEG_ROM_MASK = 0x1ffff;
-constexpr size_t DVC_PLM_BUFFER_CAPACITY = 512 * 1024;
+constexpr size_t DVC_PLM_BUFFER_CAPACITY = 2 * 1024 * 1024;
+constexpr size_t DVC_AUDIO_ES_BUFFER_CAPACITY = 8 * 1024 * 1024;
 constexpr uint32_t DVC_DMA_FALLBACK_MAX_BYTES = 0x2000;
 constexpr uint32_t DVC_DMA_AUDIO_SECTOR_BYTES = 2356;
 
@@ -120,12 +122,6 @@ uint16_t dvc_rate_code(double rate_hz)
 	if (rate_hz >= 23.0)
 		return 1;
 	return 0;
-}
-
-int16_t dvc_float_to_sample(float sample)
-{
-	const int value = int(sample * 32767.0f);
-	return int16_t(std::max(-32768, std::min(32767, value)));
 }
 
 uint16_t dvc_reduced_timestamp(int64_t timestamp)
@@ -400,6 +396,9 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_audio_sample_rate));
 	save_item(NAME(m_dvc_audio_dma_last_mac));
 	save_item(NAME(m_dvc_audio_dma_span_hint));
+	save_item(NAME(m_dvc_audio_es_bytes));
+	save_item(NAME(m_dvc_audio_es_bitpos));
+	save_item(NAME(m_dvc_audio_mpeg_header));
 	save_item(NAME(m_dvc_frame_rate_hz));
 	save_item(NAME(m_dvc_dclk_base));
 
@@ -674,7 +673,6 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 {
 	const uint32_t current_dclk = uint32_t(machine().time().as_ticks(45000) - m_dvc_dclk_base);
 	m_dvc_fma_dclk = current_dclk;
-	const size_t available_samples = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
 	constexpr size_t chunk_samples = 64;
 	// MiSTer drains PCM from a decoder-owned FIFO at a fixed 44.1 kHz rate.
 	// Our simplified path decodes into software queues in larger bursts. Start
@@ -682,6 +680,7 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 	// so Joy-style sparse decode bursts don't produce long silent holes.
 	constexpr size_t audio_start_prebuffer_samples = 2304;
 	constexpr size_t audio_resume_prebuffer_samples = 64;
+	size_t available_samples = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
 	const size_t resume_threshold = m_dvc_audio_output_started_once ? audio_resume_prebuffer_samples : audio_start_prebuffer_samples;
 
 	// MiSTer enables the FMA DSP when the stream start time is reached; the
@@ -716,6 +715,24 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 
 	if (!m_dvc_audio_sample_rate)
 		return;
+
+	// MiSTer's audio decoder runs continuously behind a FIFO; our software model
+	// only gets new PCM when we explicitly ask pl_mpeg for more. If the local
+	// FIFO is running low but compressed bytes are already buffered, opportunisti-
+	// cally decode again here instead of waiting for another DMA burst.
+	if (m_dvc_audio_decoder)
+	{
+		const size_t queued_before = available_samples;
+		const size_t buffered_bytes = (m_dvc_audio_es_bitpos >= 0 && m_dvc_audio_es_bytes >= size_t(m_dvc_audio_es_bitpos >> 3))
+			? (m_dvc_audio_es_bytes - size_t(m_dvc_audio_es_bitpos >> 3))
+			: 0;
+		if ((queued_before < std::max(resume_threshold, chunk_samples * 8))
+			&& (buffered_bytes >= 4))
+		{
+			dvc_decode_audio();
+			available_samples = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
+		}
+	}
 
 	if (!available_samples)
 	{
@@ -866,6 +883,7 @@ void cdi_state::dvc_reset()
 	m_dvc_playback_active = false;
 	m_dvc_video_visible = false;
 	m_dvc_video_show_pending = false;
+	m_dvc_fmv_program_end_seen = false;
 	m_dvc_fma_started = false;
 	m_dvc_fma_pending_stream_change = false;
 	m_dvc_audio_output_active = false;
@@ -917,6 +935,7 @@ void cdi_state::dvc_reset_video_decoder()
 	m_dvc_image_width = 0;
 	m_dvc_image_height = 0;
 	m_dvc_image_rt = 0;
+	m_dvc_fmv_program_end_seen = false;
 	m_dvc_fmv_video_data_input_command &= ~0x4000;
 	dvc_reset_demux(m_dvc_video_demux_state);
 
@@ -927,14 +946,14 @@ void cdi_state::dvc_reset_video_decoder()
 void cdi_state::dvc_reset_audio_decoder()
 {
 	LOGMASKED(LOG_DVC, "%s: DVC reset audio decoder\n", machine().describe_context());
-	if (m_dvc_audio_plm)
-	{
-		plm_audio_destroy(m_dvc_audio_plm);
-		m_dvc_audio_plm = nullptr;
-		m_dvc_audio_buffer = nullptr;
-	}
 
 	dvc_reset_demux(m_dvc_audio_demux_state);
+	m_dvc_audio_decoder.reset();
+	if (m_dvc_audio_es.size() != DVC_AUDIO_ES_BUFFER_CAPACITY)
+		m_dvc_audio_es.resize(DVC_AUDIO_ES_BUFFER_CAPACITY);
+	m_dvc_audio_es_bytes = 0;
+	m_dvc_audio_es_bitpos = 0;
+	m_dvc_audio_mpeg_header = 0;
 	m_dvc_audio_pcm[0].clear();
 	m_dvc_audio_pcm[1].clear();
 	m_dvc_audio_sample_rate = 0;
@@ -948,8 +967,10 @@ void cdi_state::dvc_reset_audio_decoder()
 	m_dmadac[0]->enable(0);
 	m_dmadac[1]->enable(0);
 	dvc_update_audio_timer();
-	m_dvc_audio_buffer = plm_buffer_create_with_capacity(DVC_PLM_BUFFER_CAPACITY);
-	m_dvc_audio_plm = m_dvc_audio_buffer ? plm_audio_create_with_buffer(m_dvc_audio_buffer, TRUE) : nullptr;
+	// VMPEG feeds the MPEG audio decoder a byte-stream FIFO; keeping the
+	// native decoder byte-aligned between frames avoids false sync at random
+	// bit offsets inside the payload.
+	m_dvc_audio_decoder = std::make_unique<mpeg_audio>(m_dvc_audio_es.data(), mpeg_audio::L2, false, 8);
 }
 
 void cdi_state::dvc_update_irq()
@@ -1110,7 +1131,7 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 {
 	auto &dma = m_maincpu->dma().channel[1];
 	address_space &program = m_maincpu->space(AS_PROGRAM);
-	uint32_t transfer_words = uint32_t(dma.transfer_counter) + 1;
+	uint32_t transfer_words = dma.transfer_counter ? (uint32_t(dma.transfer_counter) + 1) : 1;
 	LOGMASKED(LOG_DVC, "%s: DVC DMA %s mac=%06x dac=%06x count=%04x words=%u seq=%02x\n",
 		machine().describe_context(),
 		video ? "video" : "audio",
@@ -1124,6 +1145,24 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 	uint32_t device_address = dma.device_address_counter;
 	const bool increment_memory = (dma.sequence_control & SCC_DMA_SEQ_MAC_INC) != 0;
 	const bool increment_device = (dma.sequence_control & SCC_DMA_SEQ_DAC_INC) != 0;
+	const uint8_t stream_filter = video ? (m_dvc_fmv_stream & 0x0f) : (m_dvc_fma_stream & 0x0f);
+
+	if (!video && increment_memory && !increment_device)
+	{
+		if (m_dvc_audio_dma_last_mac)
+		{
+			const uint32_t delta = (memory_address >= m_dvc_audio_dma_last_mac)
+				? (memory_address - m_dvc_audio_dma_last_mac)
+				: (m_dvc_audio_dma_last_mac - memory_address);
+
+			if (delta == DVC_DMA_AUDIO_SECTOR_BYTES)
+				m_dvc_audio_dma_span_hint = DVC_DMA_AUDIO_SECTOR_BYTES;
+			else if (delta == 2304)
+				m_dvc_audio_dma_span_hint = 2304;
+		}
+
+		m_dvc_audio_dma_last_mac = memory_address;
+	}
 
 	if (video && (m_dvc_fmv_interrupt_status & DVC_FMV_ISR_NDAT))
 	{
@@ -1154,34 +1193,7 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 	// to pulling one contiguous MPEG packet span from RAM when that happens.
 	if ((dma.transfer_counter == 0) && increment_memory && !increment_device)
 	{
-		const uint8_t stream_filter = video ? (m_dvc_fmv_stream & 0x0f) : (m_dvc_fma_stream & 0x0f);
 		uint32_t fallback_bytes = dvc_scan_dma_fallback_bytes(program, memory_address, video, stream_filter);
-		if (!video)
-		{
-			if (m_dvc_audio_dma_last_mac)
-			{
-				const uint32_t delta = (memory_address >= m_dvc_audio_dma_last_mac)
-					? (memory_address - m_dvc_audio_dma_last_mac)
-					: (m_dvc_audio_dma_last_mac - memory_address);
-
-				if (delta == DVC_DMA_AUDIO_SECTOR_BYTES)
-					m_dvc_audio_dma_span_hint = DVC_DMA_AUDIO_SECTOR_BYTES;
-				else if (delta == 2304)
-					m_dvc_audio_dma_span_hint = 2304;
-			}
-
-			m_dvc_audio_dma_last_mac = memory_address;
-
-			// Joy uses 2356-byte sector-sized DMA slots, while Weather alternates
-			// between 2304-byte audio buffers. Only extend the guessed fallback
-			// span once the observed DMA stride tells us we're in the Joy case.
-			if ((fallback_bytes >= 2304)
-				&& (fallback_bytes < DVC_DMA_AUDIO_SECTOR_BYTES)
-				&& (m_dvc_audio_dma_span_hint == DVC_DMA_AUDIO_SECTOR_BYTES))
-			{
-				fallback_bytes = DVC_DMA_AUDIO_SECTOR_BYTES;
-			}
-		}
 		transfer_words = fallback_bytes / 2;
 		LOGMASKED(LOG_DVC, "%s: DVC DMA %s using zero-count fallback bytes=%u words=%u\n",
 			machine().describe_context(),
@@ -1189,7 +1201,6 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 			fallback_bytes,
 			transfer_words);
 	}
-
 	// MiSTer's SCC68070 DMA engine treats the transfer counter as "remaining words - 1",
 	// so a count of 0 still performs one final 16-bit transfer before completion.
 	for (uint32_t remaining = transfer_words; remaining > 0; remaining--)
@@ -1223,7 +1234,7 @@ void cdi_state::dvc_feed_bytes(bool video, const uint8_t *data, size_t bytes)
 {
 	if (video && !m_dvc_video_plm)
 		dvc_reset_video_decoder();
-	if (!video && !m_dvc_audio_plm)
+	if (!video && !m_dvc_audio_decoder)
 		dvc_reset_audio_decoder();
 
 	if (!data || !bytes)
@@ -1236,7 +1247,7 @@ void cdi_state::dvc_feed_bytes(bool video, const uint8_t *data, size_t bytes)
 void cdi_state::dvc_process_demux_byte(bool video, uint8_t data)
 {
 	dvc_demux_state &demux = video ? m_dvc_video_demux_state : m_dvc_audio_demux_state;
-	plm_buffer_t *const decoder_buffer = video ? m_dvc_video_buffer : m_dvc_audio_buffer;
+	plm_buffer_t *const video_buffer = video ? m_dvc_video_buffer : nullptr;
 	const uint8_t stream_filter = video ? (m_dvc_fmv_stream & 0x0f) : (m_dvc_fma_stream & 0x0f);
 	const uint32_t dclk = video ? 0 : m_dvc_fma_dclk;
 	const bool packet_body = demux.packet_body;
@@ -1439,12 +1450,12 @@ void cdi_state::dvc_process_demux_byte(bool video, uint8_t data)
 		{
 			demux.phase = dvc_demux_state::PACK0;
 		}
-		else if ((data & 0xf0) == 0xc0)
+		else if (!video && ((data & 0xf0) == 0xc0))
 		{
 			if ((data & 0x0f) == stream_filter)
 				demux.phase = dvc_demux_state::PES0;
 		}
-		else if ((data & 0xf0) == 0xe0)
+		else if (video && ((data & 0xf0) == 0xe0))
 		{
 			if ((data & 0x0f) == stream_filter)
 				demux.phase = dvc_demux_state::PES0;
@@ -1491,15 +1502,44 @@ void cdi_state::dvc_process_demux_byte(bool video, uint8_t data)
 		demux.packet_body = false;
 	}
 
-	if (packet_body && decoder_buffer)
-		plm_buffer_write(decoder_buffer, &data, 1);
+	if (packet_body)
+	{
+		if (video && video_buffer)
+		{
+			plm_buffer_write(video_buffer, &data, 1);
+		}
+		else if (!video && (m_dvc_audio_es_bytes < m_dvc_audio_es.size()))
+		{
+			// Keep a large, fixed backing store so the MPEG audio decoder can
+			// continue to reference the same base pointer while we slide
+			// consumed bytes down in-place between bursts.
+			if ((m_dvc_audio_es_bitpos >= 8192) && ((m_dvc_audio_es_bitpos & 7) == 0))
+			{
+				const size_t consumed_bytes = size_t(m_dvc_audio_es_bitpos >> 3);
+				if (consumed_bytes && consumed_bytes <= m_dvc_audio_es_bytes)
+				{
+					const size_t remaining = m_dvc_audio_es_bytes - consumed_bytes;
+					std::memmove(m_dvc_audio_es.data(), m_dvc_audio_es.data() + consumed_bytes, remaining);
+					m_dvc_audio_es_bytes = uint32_t(remaining);
+					m_dvc_audio_es_bitpos -= int(consumed_bytes * 8);
+				}
+			}
+
+			if (m_dvc_audio_es_bytes < m_dvc_audio_es.size())
+				m_dvc_audio_es[m_dvc_audio_es_bytes++] = data;
+		}
+	}
 
 	if (video && demux.decoding_timestamp_updated)
 		m_dvc_fmv_demux_timestamp = dvc_reduced_timestamp(demux.decoding_timestamp);
 	if (demux.event_program_end)
 	{
+		if (video_buffer)
+			plm_buffer_signal_end(video_buffer);
+
 		if (video)
 		{
+			m_dvc_fmv_program_end_seen = true;
 			dvc_raise_fmv_irq(DVC_FMV_ISR_EII);
 		}
 		else
@@ -1573,14 +1613,67 @@ void cdi_state::dvc_decode_video()
 
 void cdi_state::dvc_decode_audio()
 {
-	if (!m_dvc_audio_plm)
+	if (!m_dvc_audio_decoder)
 		return;
 
-	if (const int sample_rate = plm_audio_get_samplerate(m_dvc_audio_plm); sample_rate > 0)
+	const int limit_bits = int(m_dvc_audio_es_bytes * 8U);
+	if ((m_dvc_audio_es_bitpos < 0) || (m_dvc_audio_es_bitpos > limit_bits))
 	{
-		if (m_dvc_audio_sample_rate != uint32_t(sample_rate))
+		LOGMASKED(LOG_DVC, "%s: DVC audio bitstream pointer out of range bitpos=%d limit=%d, resetting decoder state\n",
+			machine().describe_context(),
+			m_dvc_audio_es_bitpos,
+			limit_bits);
+		m_dvc_audio_es_bitpos = 0;
+		m_dvc_audio_decoder->clear();
+	}
+
+	bool decoded_any = false;
+	size_t decoded_samples = 0;
+	std::array<short, 1152 * 2> decoded{};
+	for (;;)
+	{
+		const int start_bitpos = m_dvc_audio_es_bitpos;
+		int next_bitpos = m_dvc_audio_es_bitpos;
+		int output_samples = 0;
+		int sample_rate = 0;
+		int channels = 0;
+		const bool complete = m_dvc_audio_decoder->decode_buffer(
+			next_bitpos,
+			int(m_dvc_audio_es_bytes * 8U),
+			decoded.data(),
+			output_samples,
+			sample_rate,
+			channels);
+		if (!complete || (next_bitpos <= start_bitpos) || !output_samples)
+			break;
+		if (next_bitpos > limit_bits)
 		{
-			m_dvc_audio_sample_rate = sample_rate;
+			LOGMASKED(LOG_DVC, "%s: DVC audio decoder advanced past buffered data bitpos=%d limit=%d, stopping decode\n",
+				machine().describe_context(),
+				next_bitpos,
+				limit_bits);
+			break;
+		}
+
+		// FMV audio is fed as a 44.1 kHz byte stream. If the decoder suddenly
+		// "finds" a different sample rate mid-stream, that's almost certainly a
+		// false sync inside the buffered payload rather than a real format
+		// change, so rescan from the next byte instead of retuning playback.
+		if ((sample_rate > 0) && m_dvc_audio_sample_rate && (uint32_t(sample_rate) != m_dvc_audio_sample_rate))
+		{
+			LOGMASKED(LOG_DVC, "%s: DVC audio resync on suspect sample rate %d Hz at bitpos=%d current=%u\n",
+				machine().describe_context(),
+				sample_rate,
+				start_bitpos,
+				unsigned(m_dvc_audio_sample_rate));
+			m_dvc_audio_decoder->clear();
+			m_dvc_audio_es_bitpos = std::min(limit_bits, start_bitpos + 8);
+			continue;
+		}
+
+		if ((sample_rate > 0) && (m_dvc_audio_sample_rate != uint32_t(sample_rate)))
+		{
+			m_dvc_audio_sample_rate = uint32_t(sample_rate);
 			LOGMASKED(LOG_DVC, "%s: DVC audio sample rate %u Hz\n",
 				machine().describe_context(),
 				unsigned(m_dvc_audio_sample_rate));
@@ -1592,23 +1685,51 @@ void cdi_state::dvc_decode_audio()
 			m_dmadac[1]->set_volume(0x100);
 			dvc_update_audio_timer();
 		}
-	}
 
-	bool decoded_any = false;
-	size_t decoded_samples = 0;
-	for (;;)
-	{
-		plm_samples_t *const samples = plm_audio_decode(m_dvc_audio_plm);
-		if (!samples)
-			break;
-
-		for (unsigned int index = 0; index < samples->count; index++)
+		if ((start_bitpos & 7) == 0)
 		{
-			m_dvc_audio_pcm[0].push_back(dvc_float_to_sample(samples->interleaved[index * 2 + 0]));
-			m_dvc_audio_pcm[1].push_back(dvc_float_to_sample(samples->interleaved[index * 2 + 1]));
+			const size_t start_byte = size_t(start_bitpos >> 3);
+			for (size_t offset = start_byte; (offset + 3) < m_dvc_audio_es_bytes && offset < (start_byte + 32); offset++)
+			{
+				if ((m_dvc_audio_es[offset + 0] == 0xff) && ((m_dvc_audio_es[offset + 1] & 0xe0) == 0xe0))
+				{
+					m_dvc_audio_mpeg_header =
+						(uint32_t(m_dvc_audio_es[offset + 0]) << 24) |
+						(uint32_t(m_dvc_audio_es[offset + 1]) << 16) |
+						(uint32_t(m_dvc_audio_es[offset + 2]) << 8) |
+						uint32_t(m_dvc_audio_es[offset + 3]);
+					break;
+				}
+			}
 		}
 
-		decoded_samples += samples->count;
+		if (channels <= 0)
+			channels = 1;
+		if (channels > 2)
+			channels = 2;
+
+		for (int index = 0; index < output_samples; index++)
+		{
+			const int16_t left = decoded[index * channels + 0];
+			const int16_t right = (channels > 1) ? decoded[index * channels + 1] : left;
+			m_dvc_audio_pcm[0].push_back(left);
+			m_dvc_audio_pcm[1].push_back(right);
+		}
+
+		m_dvc_audio_es_bitpos = next_bitpos;
+		if ((m_dvc_audio_es_bitpos >= 16384) && ((m_dvc_audio_es_bitpos & 7) == 0))
+		{
+			const size_t consumed_bytes = size_t(m_dvc_audio_es_bitpos >> 3);
+			if (consumed_bytes && consumed_bytes <= m_dvc_audio_es_bytes)
+			{
+				const size_t remaining = m_dvc_audio_es_bytes - consumed_bytes;
+				std::memmove(m_dvc_audio_es.data(), m_dvc_audio_es.data() + consumed_bytes, remaining);
+				m_dvc_audio_es_bytes = uint32_t(remaining);
+				m_dvc_audio_es_bitpos -= int(consumed_bytes * 8);
+			}
+		}
+
+		decoded_samples += size_t(output_samples);
 		decoded_any = true;
 	}
 
@@ -1632,11 +1753,6 @@ void cdi_state::dvc_decode_audio()
 			dvc_raise_fma_irq(DVC_FMA_ISR_CSU);
 		}
 	}
-	else if (m_dvc_fma_started && plm_audio_has_ended(m_dvc_audio_plm))
-	{
-		m_dvc_fma_status |= 0x01;
-		dvc_raise_fma_irq(DVC_FMA_ISR_EOI);
-	}
 }
 
 void cdi_state::dvc_present_next_frame()
@@ -1646,6 +1762,11 @@ void cdi_state::dvc_present_next_frame()
 
 	m_dvc_display_frame = std::move(m_dvc_video_queue.front());
 	m_dvc_video_queue.pop_front();
+	const bool last_program_frame =
+		m_dvc_fmv_program_end_seen &&
+		m_dvc_video_queue.empty() &&
+		m_dvc_video_plm &&
+		plm_video_has_ended(m_dvc_video_plm);
 	uint32_t sample_luma_min = 0xff;
 	uint32_t sample_luma_max = 0x00;
 	uint32_t sample_nonblack = 0;
@@ -1688,6 +1809,11 @@ void cdi_state::dvc_present_next_frame()
 
 	dvc_rebuild_external_video();
 	dvc_raise_fmv_irq(DVC_FMV_ISR_PIC);
+	if (last_program_frame)
+	{
+		m_dvc_fmv_program_end_seen = false;
+		dvc_raise_fmv_irq(DVC_FMV_ISR_EOD);
+	}
 }
 
 void cdi_state::dvc_rebuild_external_video()
@@ -1803,8 +1929,8 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 	case 0x300e: data = 0x0042; break;
 	case 0x3010: data = current_dclk >> 16; break;
 	case 0x3012: data = current_dclk & 0xffff; break;
-	case 0x3014: data = m_dvc_audio_plm ? uint16_t(m_dvc_audio_plm->header >> 16) : 0; break;
-	case 0x3016: data = m_dvc_audio_plm ? uint16_t(m_dvc_audio_plm->header & 0xffff) : 0; break;
+	case 0x3014: data = uint16_t(m_dvc_audio_mpeg_header >> 16); break;
+	case 0x3016: data = uint16_t(m_dvc_audio_mpeg_header & 0xffff); break;
 	case 0x3018: data = m_dvc_fma_dsp_enable & 0x0001; break;
 	case 0x301a:
 		data = m_dvc_fma_interrupt_status;

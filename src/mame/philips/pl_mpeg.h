@@ -1535,7 +1535,8 @@ size_t plm_buffer_get_size(plm_buffer_t *self) {
 }
 
 size_t plm_buffer_get_remaining(plm_buffer_t *self) {
-	return self->length - (self->bit_index >> 3);
+	size_t byte_pos = self->bit_index >> 3;
+	return (byte_pos < self->length) ? (self->length - byte_pos) : 0;
 }
 
 size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
@@ -1614,7 +1615,7 @@ size_t plm_buffer_tell(plm_buffer_t *self) {
 
 void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
 	size_t byte_pos = self->bit_index >> 3;
-	if (byte_pos == self->length) {
+	if (byte_pos >= self->length) {
 		self->bit_index = 0;
 		self->length = 0;
 	}
@@ -1660,14 +1661,18 @@ int plm_buffer_has_ended(plm_buffer_t *self) {
 }
 
 int plm_buffer_has(plm_buffer_t *self, size_t count) {
-	if (((self->length << 3) - self->bit_index) >= count) {
+	size_t length_bits = self->length << 3;
+	size_t available_bits = (self->bit_index <= length_bits) ? (length_bits - self->bit_index) : 0;
+	if (available_bits >= count) {
 		return TRUE;
 	}
 
 	if (self->load_callback) {
 		self->load_callback(self, self->load_callback_user_data);
-		
-		if (((self->length << 3) - self->bit_index) >= count) {
+
+		length_bits = self->length << 3;
+		available_bits = (self->bit_index <= length_bits) ? (length_bits - self->bit_index) : 0;
+		if (available_bits >= count) {
 			return TRUE;
 		}
 	}	
@@ -1682,7 +1687,13 @@ int plm_buffer_read(plm_buffer_t *self, int count) {
 	int value = 0;
 
 	while (count) {
-		int current_byte = self->bytes[self->bit_index >> 3];
+		size_t byte_index = self->bit_index >> 3;
+		if (byte_index >= self->length) {
+			self->bit_index = self->length << 3;
+			break;
+		}
+
+		int current_byte = self->bytes[byte_index];
 
 		int remaining = 8 - (self->bit_index & 7); // Remaining bits in byte
 		int read = remaining < count ? remaining : count; // Bits in self run

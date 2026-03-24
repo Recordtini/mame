@@ -29,98 +29,228 @@ void mpeg_audio::clear()
 	memset(audio_buffer, 0, sizeof(audio_buffer));
 	audio_buffer_pos[0] = 16*32;
 	audio_buffer_pos[1] = 16*32;
+	frame_bytes = 0;
 }
 
 bool mpeg_audio::decode_buffer(int &pos, int limit, short *output,
 								int &output_samples, int &sample_rate, int &channels, int atbl)
 {
-	if(limit - pos < 16)
+	const int search_step = position_align ? (position_align + 1) : 1;
+	int search_pos = pos;
+
+	if(position_align)
+		search_pos = (search_pos + position_align) & ~position_align;
+
+	if(limit - search_pos < 16)
 		return false;
 
-	// Scan for the sync mark
-	//
-	// Avoid the exception dance at the point where going out of bound
-	// is the most probable and easily avoidable
+	while(limit - search_pos >= 16) {
+		const int frame_start = search_pos;
+		const int saved_sampling_rate = sampling_rate;
+		const int saved_last_frame_number = last_frame_number;
+		const int saved_param_index = param_index;
+		const int saved_cbr_param_index = cbr_param_index;
+		const int saved_frame_bytes = frame_bytes;
+		const int saved_channel_count = channel_count;
+		const int saved_total_bands = total_bands;
+		const int saved_joint_bands = joint_bands;
+		const int saved_current_pos = current_pos;
+		const int saved_current_limit = current_limit;
+		int saved_band_param[2][32];
+		int saved_scfsi[2][32];
+		int saved_scf[2][3][32];
+		double saved_amp_values[2][3][32];
+		double saved_bdata[2][3][32];
+		double saved_subbuffer[2][32];
+		std::memcpy(saved_band_param, band_param, sizeof(saved_band_param));
+		std::memcpy(saved_scfsi, scfsi, sizeof(saved_scfsi));
+		std::memcpy(saved_scf, scf, sizeof(saved_scf));
+		std::memcpy(saved_amp_values, amp_values, sizeof(saved_amp_values));
+		std::memcpy(saved_bdata, bdata, sizeof(saved_bdata));
+		std::memcpy(saved_subbuffer, subbuffer, sizeof(saved_subbuffer));
+		current_pos = search_pos;
+		current_limit = limit;
+		cbr_param_index = atbl;
+		frame_bytes = 0;
 
-	current_pos = pos;
-	current_limit = limit;
-	cbr_param_index = atbl;
-	unsigned short sync = do_gb(base, current_pos, 12);
+		if(do_gb(base, current_pos, 12) != 0xfff) {
+			search_pos += search_step;
+			continue;
+		}
 
-	retry_sync:
-	while(sync != 0xfff && current_pos < limit)
-		sync = ((sync << 1) | do_gb(base, current_pos, 1)) & 0xfff;
+		if(limit - current_pos < 4)
+			return false;
 
-	if(limit - current_pos < 4)
+		int layer = 0;
+		int variant = do_gb(base, current_pos, 3);
+		switch(variant) {
+		case 2:
+			if(accepted & L2_5)
+				layer = 2;
+			else if(accepted & AMM)
+				layer = 4;
+			break;
+
+		case 5:
+			if(accepted & L3)
+				layer = 3;
+			break;
+
+		case 6:
+			if(accepted & (L2|L2_5))
+				layer = 2;
+			else if(accepted & AMM)
+				layer = 4;
+			break;
+
+		case 7:
+			if(accepted & L1)
+				layer = 1;
+			break;
+		}
+
+		if(!layer) {
+			search_pos += search_step;
+			continue;
+		}
+
+		try {
+			switch(layer) {
+			case 1:
+				abort();
+			case 2:
+				read_header_mpeg2(variant == 2);
+				read_data_mpeg2();
+				decode_mpeg2(output, output_samples);
+				break;
+			case 3:
+				abort();
+			case 4:
+				read_header_amm(variant == 2);
+				read_data_mpeg2();
+				if(last_frame_number)
+					decode_mpeg2(output, output_samples);
+				break;
+			}
+		} catch(limit_hit) {
+			sampling_rate = saved_sampling_rate;
+			last_frame_number = saved_last_frame_number;
+			param_index = saved_param_index;
+			cbr_param_index = saved_cbr_param_index;
+			frame_bytes = saved_frame_bytes;
+			channel_count = saved_channel_count;
+			total_bands = saved_total_bands;
+			joint_bands = saved_joint_bands;
+			current_pos = saved_current_pos;
+			current_limit = saved_current_limit;
+			std::memcpy(band_param, saved_band_param, sizeof(saved_band_param));
+			std::memcpy(scfsi, saved_scfsi, sizeof(saved_scfsi));
+			std::memcpy(scf, saved_scf, sizeof(saved_scf));
+			std::memcpy(amp_values, saved_amp_values, sizeof(saved_amp_values));
+			std::memcpy(bdata, saved_bdata, sizeof(saved_bdata));
+			std::memcpy(subbuffer, saved_subbuffer, sizeof(saved_subbuffer));
+			return false;
+		} catch(invalid_header) {
+			search_pos += search_step;
+			continue;
+		}
+
+		// Layer II frames are byte-sized containers. The bit parser only
+		// consumes the audio payload; ancillary bytes can remain at the end of
+		// the frame. Advance to the actual frame boundary so the next sync scan
+		// doesn't start inside those trailing bytes.
+		if (frame_bytes > 0)
+		{
+			const int frame_limit = frame_start + frame_bytes * 8;
+			if (frame_limit > limit)
+				return false;
+			if (!next_header_plausible(frame_limit, limit))
+			{
+				search_pos += search_step;
+				continue;
+			}
+			current_pos = frame_limit;
+		}
+
+		if(position_align)
+			current_pos = (current_pos + position_align) & ~position_align;
+
+		pos = current_pos;
+		sample_rate = sample_rates[sampling_rate];
+		channels = channel_count;
+		return true;
+	}
+
+	return false;
+}
+
+bool mpeg_audio::next_header_plausible(int bitpos, int limit) const
+{
+	static constexpr int layer2_bitrates_mpeg1[16] = {
+		0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0
+	};
+	static constexpr int layer2_bitrates_lsf[16] = {
+		0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0
+	};
+
+	if (bitpos & 7)
+		return true;
+	if (limit - bitpos < 32)
+		return true;
+
+	const size_t offset = size_t(bitpos >> 3);
+	const uint32_t header =
+		(uint32_t(base[offset + 0]) << 24) |
+		(uint32_t(base[offset + 1]) << 16) |
+		(uint32_t(base[offset + 2]) << 8) |
+		uint32_t(base[offset + 3]);
+
+	if ((header & 0xfff00000U) != 0xfff00000U)
 		return false;
 
-	int layer = 0;
-	int variant = do_gb(base, current_pos, 3);
-	switch(variant) {
+	const int variant = (header >> 17) & 0x7;
+	bool layer25 = false;
+	switch (variant)
+	{
 	case 2:
-		if(accepted & L2_5)
-			layer = 2;
-		else if(accepted & AMM)
-			layer = 4;
-		break;
-
-	case 5:
-		if(accepted & L3)
-			layer = 3;
+		layer25 = true;
+		if (!(accepted & L2_5))
+			return (accepted & AMM) != 0;
 		break;
 
 	case 6:
-		if(accepted & (L2|L2_5))
-			layer = 2;
-		else if(accepted & AMM)
-			layer = 4;
+		if (!(accepted & (L2 | L2_5)))
+			return (accepted & AMM) != 0;
 		break;
 
-	case 7:
-		if(accepted & L1)
-			layer = 1;
-		break;
+	default:
+		// Keep validation broad but low-risk: only enforce it for the Layer II
+		// path the CD-i DVC actually uses.
+		return true;
 	}
 
-	if(!layer) {
-		current_pos -= 3;
-		sync = ((sync << 1) | do_gb(base, current_pos, 1)) & 0xfff;
-		goto retry_sync;
-	}
+	const int bitrate_index = (header >> 12) & 0xf;
+	const int sampling_index = (header >> 10) & 0x3;
+	const int padding = (header >> 9) & 0x1;
+	const int stereo_mode = (header >> 6) & 0x3;
+	if ((bitrate_index <= 0) || (bitrate_index >= 15) || (sampling_index >= 3))
+		return false;
 
-	switch(layer) {
-	case 1:
-		abort();
-	case 2:
-		try {
-			read_header_mpeg2(variant == 2);
-			read_data_mpeg2();
-			decode_mpeg2(output, output_samples);
-		} catch(limit_hit) {
-			return false;
-		}
-		break;
-	case 3:
-		abort();
-	case 4:
-		try {
-			read_header_amm(variant == 2);
-			read_data_mpeg2();
-			if(last_frame_number)
-				decode_mpeg2(output, output_samples);
-		} catch(limit_hit) {
-			return false;
-		}
-		break;
-	}
+	const int channel_count = (stereo_mode != 3) ? 2 : 1;
+	const int param = layer2_param_index[channel_count - 1][sampling_index][bitrate_index];
+	if (param == -1)
+		return false;
 
-	if(position_align)
-		current_pos = (current_pos + position_align) & ~position_align;
+	const int sample_rate_hz = sample_rates[sampling_index + (layer25 ? 4 : 0)];
+	if (!sample_rate_hz)
+		return false;
 
-	pos = current_pos;
-	sample_rate = sample_rates[sampling_rate];
-	channels = channel_count;
-	return true;
+	const int bitrate_kbps = layer25 ? layer2_bitrates_lsf[bitrate_index] : layer2_bitrates_mpeg1[bitrate_index];
+	if (!bitrate_kbps)
+		return false;
+
+	const int next_frame_bytes = ((144000 * bitrate_kbps) / sample_rate_hz) + padding;
+	return next_frame_bytes > 0;
 }
 
 void mpeg_audio::read_header_amm(bool layer25)
@@ -145,22 +275,42 @@ void mpeg_audio::read_header_amm(bool layer25)
 	}
 	gb(1); // must be zero
 
+	if (sampling_rate < 0 || sampling_rate >= 8 || sample_rates[sampling_rate] == 0)
+		throw invalid_header();
+	if (param_index < 0 || param_index >= 5)
+		throw invalid_header();
+
 	channel_count = stereo_mode != 3 ? 2 : 1;
 
 	total_bands = total_band_counts[param_index];
 	joint_bands = total_bands;
 	if(stereo_mode == 1) // joint stereo
 		joint_bands = joint_band_counts[stereo_mode_ext];
+	if (channel_count < 1 || channel_count > 2)
+		throw invalid_header();
+	if (total_bands < 0 || total_bands > 32)
+		throw invalid_header();
+	if (joint_bands < 0)
+		throw invalid_header();
 	if(joint_bands > total_bands )
 		joint_bands = total_bands;
+
+	frame_bytes = 0;
 }
 
 void mpeg_audio::read_header_mpeg2(bool layer25)
 {
+	static constexpr int layer2_bitrates_mpeg1[16] = {
+		0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0
+	};
+	static constexpr int layer2_bitrates_lsf[16] = {
+		0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0
+	};
+
 	int prot = gb(1);
 	int bitrate_index = gb(4);
 	sampling_rate = gb(2);
-	gb(1); // padding
+	int padding = gb(1);
 	gb(1);
 	last_frame_number = 36;
 	int stereo_mode = gb(2);
@@ -173,14 +323,33 @@ void mpeg_audio::read_header_mpeg2(bool layer25)
 	channel_count = stereo_mode != 3 ? 2 : 1;
 
 	param_index = layer2_param_index[channel_count-1][sampling_rate][bitrate_index];
-	assert(param_index != -1);
+	if (sample_rates[sampling_rate] == 0 || param_index == -1)
+		throw invalid_header();
 
 	total_bands = total_band_counts[param_index];
 	joint_bands = total_bands;
 	if(stereo_mode == 1) // joint stereo
 		joint_bands = joint_band_counts[stereo_mode_ext];
+	if (channel_count < 1 || channel_count > 2)
+		throw invalid_header();
+	if (total_bands < 0 || total_bands > 32)
+		throw invalid_header();
+	if (joint_bands < 0)
+		throw invalid_header();
 	if(joint_bands > total_bands )
 		joint_bands = total_bands;
+
+	const int bitrate_kbps = layer25 ? layer2_bitrates_lsf[bitrate_index] : layer2_bitrates_mpeg1[bitrate_index];
+	if (!bitrate_kbps)
+		throw invalid_header();
+
+	const int sample_rate_hz = sample_rates[sampling_rate];
+	if (!sample_rate_hz)
+		throw invalid_header();
+
+	frame_bytes = ((144000 * bitrate_kbps) / sample_rate_hz) + padding;
+	if (frame_bytes <= 0)
+		throw invalid_header();
 }
 
 void mpeg_audio::read_data_mpeg2()
@@ -559,8 +728,18 @@ int mpeg_audio::do_gb_lsb(const unsigned char *data, int &pos, int count)
 int mpeg_audio::get_band_param(int band)
 {
 	int bit_count = band_parameter_index_bits_count[param_index][band];
+	if (bit_count < 0 || bit_count > 4)
+		throw invalid_header();
+
 	int index = gb(bit_count);
-	return band_parameter_indexed_values[param_index][band][index];
+	if (index < 0 || index >= 17)
+		throw invalid_header();
+
+	const int value = band_parameter_indexed_values[param_index][band][index];
+	if (value < 0 || value >= 18)
+		throw invalid_header();
+
+	return value;
 }
 
 void mpeg_audio::read_band_params()
@@ -681,11 +860,18 @@ void mpeg_audio::read_band_value_triplet(int chan, int band)
 	}
 	}
 
-	double scale = 1 << (band_infos[band_idx].bits - 1);
-
-	bdata[chan][0][band] = ((buffer[0] - scale) / scale + band_infos[band_idx].offset) * band_infos[band_idx].scale;
-	bdata[chan][1][band] = ((buffer[1] - scale) / scale + band_infos[band_idx].offset) * band_infos[band_idx].scale;
-	bdata[chan][2][band] = ((buffer[2] - scale) / scale + band_infos[band_idx].offset) * band_infos[band_idx].scale;
+	// Keep Layer II dequantization in the same "levels+1" family for all
+	// quantizer tables. The bundled MAME formula works well enough for
+	// full-file decode, but the streamed CD-i DVC path still shows a
+	// frame-period click that lines up with sample reconstruction, not
+	// transport. This variant reduced that periodic error most in harness
+	// tests without touching the DVC wrapper.
+	const double levels = double(band_infos[band_idx].modulo);
+	const double adj = ((levels + 1.0) / 2.0) - 1.0;
+	const double norm = 2.0 / (levels + 1.0);
+	bdata[chan][0][band] = (buffer[0] - adj) * norm;
+	bdata[chan][1][band] = (buffer[1] - adj) * norm;
+	bdata[chan][2][band] = (buffer[2] - adj) * norm;
 }
 
 void mpeg_audio::build_next_segments(int step)
@@ -702,7 +888,7 @@ void mpeg_audio::build_next_segments(int step)
 		band++;
 	}
 
-	while(band < joint_bands) {
+	while(band < total_bands) {
 		read_band_value_triplet(0, band);
 		bdata[1][0][band] = bdata[0][0][band];
 		bdata[1][1][band] = bdata[0][1][band];
@@ -760,14 +946,15 @@ void mpeg_audio::resynthesis(const double *input, double *output)
 void mpeg_audio::scale_and_clamp(const double *input, short *output, int step)
 {
 	for(int i=0; i<32; i++) {
-		double val = input[i]*32768 + 0.5;
+		double val = input[i] * 32768.0;
+		const double rounded = (val < 0.0) ? (val - 0.5) : (val + 0.5);
 		short cval;
-		if(val <= -32768)
+		if(rounded <= -32768)
 			cval = -32768;
-		else if(val >= 32767)
+		else if(rounded >= 32767)
 			cval = 32767;
 		else
-			cval = int(val);
+			cval = int(rounded);
 		*output = cval;
 		output += step;
 	}

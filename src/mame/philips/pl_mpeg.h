@@ -3906,6 +3906,28 @@ struct plm_audio_t {
 int plm_audio_find_frame_sync(plm_audio_t *self);
 int plm_audio_decode_header(plm_audio_t *self);
 void plm_audio_decode_frame(plm_audio_t *self);
+int plm_audio_parse_header_at(
+	plm_audio_t *self,
+	size_t byte_index,
+	int *version,
+	int *layer,
+	int *hasCRC,
+	int *bitrate_index,
+	int *samplerate_index,
+	int *padding,
+	int *private_bit,
+	int *mode,
+	int *mode_extension,
+	int *frame_size
+);
+int plm_audio_verify_following_header(
+	plm_audio_t *self,
+	size_t byte_index,
+	int frame_size,
+	int bitrate_index,
+	int samplerate_index,
+	int mode
+);
 const plm_quantizer_spec_t *plm_audio_read_allocation(plm_audio_t *self, int sb, int tab3);
 void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part); 
 void plm_audio_idct36(int s[32][3], int ss, float *d, int dp);
@@ -4001,16 +4023,62 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self) {
 
 int plm_audio_find_frame_sync(plm_audio_t *self) {
 	size_t i;
-	for (i = self->buffer->bit_index >> 3; i < self->buffer->length-1; i++) {
-		if (
-			self->buffer->bytes[i] == 0xFF &&
-			(self->buffer->bytes[i+1] & 0xFE) == 0xFC
-		) {
-			self->buffer->bit_index = ((i+1) << 3) + 3;
-			return TRUE;
+	for (i = self->buffer->bit_index >> 3; i + 3 < self->buffer->length; i++) {
+		int version = 0;
+		int layer = 0;
+		int hasCRC = 0;
+		int bitrate_index = 0;
+		int samplerate_index = 0;
+		int padding = 0;
+		int private_bit = 0;
+		int mode = 0;
+		int mode_extension = 0;
+		int frame_size = 0;
+
+		if (!plm_audio_parse_header_at(
+			self,
+			i,
+			&version,
+			&layer,
+			&hasCRC,
+			&bitrate_index,
+			&samplerate_index,
+			&padding,
+			&private_bit,
+			&mode,
+			&mode_extension,
+			&frame_size
+		)) {
+			continue;
 		}
+
+		if (
+			self->has_header &&
+			(
+				self->bitrate_index != bitrate_index ||
+				self->samplerate_index != samplerate_index ||
+				self->mode != mode
+			)
+		) {
+			continue;
+		}
+
+		if (!plm_audio_verify_following_header(
+			self,
+			i,
+			frame_size,
+			bitrate_index,
+			samplerate_index,
+			mode
+		)) {
+			continue;
+		}
+
+		self->buffer->bit_index = ((i + 1) << 3) + 3;
+		return TRUE;
 	}
-	self->buffer->bit_index = (i + 1) << 3;
+
+	self->buffer->bit_index = self->buffer->length << 3;
 	return FALSE;
 }
 
@@ -4020,23 +4088,91 @@ int plm_audio_decode_header(plm_audio_t *self) {
 	}
 
 	plm_buffer_skip_bytes(self->buffer, 0x00);
-	int sync = plm_buffer_read(self->buffer, 11);
+	size_t header_byte_index = self->buffer->bit_index >> 3;
+	int version = 0;
+	int layer = 0;
+	int hasCRC = 0;
+	int bitrate_index = 0;
+	int samplerate_index = 0;
+	int padding = 0;
+	int private_bit = 0;
+	int mode = 0;
+	int mode_extension = 0;
+	int frame_size = 0;
 
-
-	// Attempt to resync if no syncword was found. This sucks balls. The MP2 
-	// stream contains a syncword just before every frame (11 bits set to 1).
-	// However, this syncword is not guaranteed to not occur elsewhere in the
-	// stream. So, if we have to resync, we also have to check if the header 
-	// (samplerate, bitrate) differs from the one we had before. This all
-	// may still lead to garbage data being decoded :/
-
-	if (sync != PLM_AUDIO_FRAME_SYNC && !plm_audio_find_frame_sync(self)) {
-		return 0;
+	if (
+		!plm_audio_parse_header_at(
+			self,
+			header_byte_index,
+			&version,
+			&layer,
+			&hasCRC,
+			&bitrate_index,
+			&samplerate_index,
+			&padding,
+			&private_bit,
+			&mode,
+			&mode_extension,
+			&frame_size
+		) ||
+		(
+			self->has_header &&
+			(
+				self->bitrate_index != bitrate_index ||
+				self->samplerate_index != samplerate_index ||
+				self->mode != mode
+			)
+		) ||
+		!plm_audio_verify_following_header(
+			self,
+			header_byte_index,
+			frame_size,
+			bitrate_index,
+			samplerate_index,
+			mode
+		)
+	) {
+		// Attempt to resync if no usable syncword was found. The MP2 stream
+		// contains a syncword just before every frame, but the bit pattern may
+		// also occur inside frame payloads. When we lose sync on bursty DVC
+		// input, scan forward until we find a header that also matches the
+		// established stream properties and, if possible, the following frame.
+		if (!plm_audio_find_frame_sync(self)) {
+			return 0;
+		}
+		header_byte_index = (self->buffer->bit_index >> 3) - 1;
+		if (
+			!plm_audio_parse_header_at(
+				self,
+				header_byte_index,
+				&version,
+				&layer,
+				&hasCRC,
+				&bitrate_index,
+				&samplerate_index,
+				&padding,
+				&private_bit,
+				&mode,
+				&mode_extension,
+				&frame_size
+			) ||
+			!plm_audio_verify_following_header(
+				self,
+				header_byte_index,
+				frame_size,
+				bitrate_index,
+				samplerate_index,
+				mode
+			)
+		) {
+			return 0;
+		}
 	}
 
-	self->version = plm_buffer_read(self->buffer, 2);
-	self->layer = plm_buffer_read(self->buffer, 2);
-	int hasCRC = !plm_buffer_read(self->buffer, 1);
+	self->buffer->bit_index = (header_byte_index + 4) << 3;
+
+	self->version = version;
+	self->layer = layer;
 
 	if (
 		self->version != PLM_AUDIO_MPEG_1 ||
@@ -4045,30 +4181,11 @@ int plm_audio_decode_header(plm_audio_t *self) {
 		return 0;
 	}
 
-	int bitrate_index = plm_buffer_read(self->buffer, 4) - 1;
 	if (bitrate_index > 13) {
 		return 0;
 	}
 
-	int samplerate_index = plm_buffer_read(self->buffer, 2);
 	if (samplerate_index == 3) {
-		return 0;
-	}
-
-	int padding = plm_buffer_read(self->buffer, 1);
-	int private_bit = plm_buffer_read(self->buffer, 1);
-	int mode = plm_buffer_read(self->buffer, 2);
-	int mode_extension = plm_buffer_read(self->buffer, 2);
-
-	// If we already have a header, make sure the samplerate, bitrate and mode
-	// are still the same, otherwise we might have missed sync.
-	if (
-		self->has_header && (
-			self->bitrate_index != bitrate_index ||
-			self->samplerate_index != samplerate_index ||
-			self->mode != mode
-		)
-	) {
 		return 0;
 	}
 
@@ -4085,9 +4202,9 @@ int plm_audio_decode_header(plm_audio_t *self) {
 		self->bound = (mode == PLM_AUDIO_MODE_MONO) ? 0 : 32;
 	}
 
-	int footer_bits = plm_buffer_read(self->buffer, 4); // copyright(1), original(1), emphasis(2)
+	int footer_bits = self->buffer->bytes[header_byte_index + 3] & 0x0f; // copyright(1), original(1), emphasis(2)
 	self->header =
-		((uint32_t)sync << 21) |
+		((uint32_t)PLM_AUDIO_FRAME_SYNC << 21) |
 		((uint32_t)self->version << 19) |
 		((uint32_t)self->layer << 17) |
 		((uint32_t)(hasCRC ? 0 : 1) << 16) |
@@ -4105,10 +4222,110 @@ int plm_audio_decode_header(plm_audio_t *self) {
 
 	// Compute frame size, check if we have enough data to decode the whole
 	// frame.
-	int bitrate = PLM_AUDIO_BIT_RATE[self->bitrate_index];
-	int samplerate = PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
-	int frame_size = (144000 * bitrate / samplerate) + padding;
 	return frame_size - (hasCRC ? 6 : 4);
+}
+
+int plm_audio_parse_header_at(
+	plm_audio_t *self,
+	size_t byte_index,
+	int *version,
+	int *layer,
+	int *hasCRC,
+	int *bitrate_index,
+	int *samplerate_index,
+	int *padding,
+	int *private_bit,
+	int *mode,
+	int *mode_extension,
+	int *frame_size
+) {
+	if (byte_index + 3 >= self->buffer->length) {
+		return FALSE;
+	}
+
+	uint8_t b0 = self->buffer->bytes[byte_index + 0];
+	uint8_t b1 = self->buffer->bytes[byte_index + 1];
+	uint8_t b2 = self->buffer->bytes[byte_index + 2];
+	uint8_t b3 = self->buffer->bytes[byte_index + 3];
+
+	if (b0 != 0xFF || (b1 & 0xFE) != 0xFC) {
+		return FALSE;
+	}
+
+	*version = (b1 >> 3) & 0x03;
+	*layer = (b1 >> 1) & 0x03;
+	*hasCRC = (b1 & 0x01) == 0;
+	if (*version != PLM_AUDIO_MPEG_1 || *layer != PLM_AUDIO_LAYER_II) {
+		return FALSE;
+	}
+
+	*bitrate_index = ((b2 >> 4) & 0x0F) - 1;
+	if (*bitrate_index < 0 || *bitrate_index > 13) {
+		return FALSE;
+	}
+
+	*samplerate_index = (b2 >> 2) & 0x03;
+	if (*samplerate_index == 3) {
+		return FALSE;
+	}
+
+	*padding = (b2 >> 1) & 0x01;
+	*private_bit = b2 & 0x01;
+	*mode = (b3 >> 6) & 0x03;
+	*mode_extension = (b3 >> 4) & 0x03;
+
+	int bitrate = PLM_AUDIO_BIT_RATE[*bitrate_index];
+	int samplerate = PLM_AUDIO_SAMPLE_RATE[*samplerate_index];
+	*frame_size = (144000 * bitrate / samplerate) + *padding;
+	return *frame_size >= 4;
+}
+
+int plm_audio_verify_following_header(
+	plm_audio_t *self,
+	size_t byte_index,
+	int frame_size,
+	int bitrate_index,
+	int samplerate_index,
+	int mode
+) {
+	size_t next_index = byte_index + frame_size;
+	if (next_index + 3 >= self->buffer->length) {
+		return TRUE;
+	}
+
+	int next_version = 0;
+	int next_layer = 0;
+	int next_hasCRC = 0;
+	int next_bitrate_index = 0;
+	int next_samplerate_index = 0;
+	int next_padding = 0;
+	int next_private_bit = 0;
+	int next_mode = 0;
+	int next_mode_extension = 0;
+	int next_frame_size = 0;
+	if (
+		!plm_audio_parse_header_at(
+			self,
+			next_index,
+			&next_version,
+			&next_layer,
+			&next_hasCRC,
+			&next_bitrate_index,
+			&next_samplerate_index,
+			&next_padding,
+			&next_private_bit,
+			&next_mode,
+			&next_mode_extension,
+			&next_frame_size
+		)
+	) {
+		return FALSE;
+	}
+
+	return
+		next_samplerate_index == samplerate_index &&
+		next_mode == mode &&
+		(!self->has_header || next_bitrate_index == bitrate_index);
 }
 
 void plm_audio_decode_frame(plm_audio_t *self) {

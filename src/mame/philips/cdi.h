@@ -8,6 +8,7 @@
 #include "cdislavehle.h"
 #include "cdicdic.h"
 #include "sound/dmadac.h"
+#include "sound/mpeg_audio.h"
 #include "mcd212.h"
 #include "cpu/mcs51/i8051.h"
 #include "cpu/m6805/m68hc05.h"
@@ -16,11 +17,11 @@
 
 #include <array>
 #include <deque>
+#include <memory>
 #include <vector>
 
 struct plm_buffer_t;
 struct plm_video_t;
-struct plm_audio_t;
 
 /*----------- driver state -----------*/
 
@@ -172,6 +173,8 @@ protected:
 	void dvc_process_demux_byte(bool video, uint8_t data);
 	void dvc_decode_video();
 	void dvc_decode_audio();
+	void dvc_update_audio_dac_fill();
+	void dvc_flush_audio_output(size_t max_samples = 0);
 	void dvc_present_next_frame();
 	void dvc_rebuild_external_video();
 
@@ -179,8 +182,11 @@ protected:
 	plm_video_t *m_dvc_video_plm = nullptr;
 	plm_buffer_t *m_dvc_video_buffer = nullptr;
 	dvc_demux_state m_dvc_audio_demux_state;
-	plm_audio_t *m_dvc_audio_plm = nullptr;
-	plm_buffer_t *m_dvc_audio_buffer = nullptr;
+	std::unique_ptr<mpeg_audio> m_dvc_audio_decoder;
+	std::vector<uint8_t> m_dvc_audio_es;
+	uint32_t m_dvc_audio_es_bytes = 0;
+	int m_dvc_audio_es_bitpos = 0;
+	uint32_t m_dvc_audio_mpeg_header = 0;
 
 	std::deque<dvc_video_frame> m_dvc_video_queue;
 	dvc_video_frame m_dvc_display_frame;
@@ -234,23 +240,28 @@ protected:
 	bool m_dvc_playback_active = false;
 	bool m_dvc_video_visible = false;
 	bool m_dvc_video_show_pending = false;
+	bool m_dvc_fmv_program_end_seen = false;
 	bool m_dvc_fma_started = false;
 	bool m_dvc_fma_pending_stream_change = false;
 	bool m_dvc_audio_output_active = false;
 	bool m_dvc_audio_output_started_once = false;
+	bool m_dvc_audio_last_decoded_valid = false;
 	bool m_dvc_fmv_register_update_latch = false;
 	bool m_dvc_fmv_register_update_scroll = false;
 	bool m_dvc_mpeg_ram_enabled = false;
 	bool m_cdic_irq_pending = false;
 	int16_t m_dvc_audio_output_level[2] = { 0, 0 };
+	int16_t m_dvc_audio_last_decoded[2] = { 0, 0 };
 	uint8_t m_dvc_mpeg_ram_enable_count = 0;
 	uint8_t m_dvc_dma_preview_count = 0;
 	uint16_t m_dvc_audio_empty_ticks = 0;
 	uint32_t m_dvc_video_present_accum = 0;
 	uint32_t m_dvc_audio_sample_rate = 0;
+	uint32_t m_dvc_audio_dac_queued_samples = 0;
 	uint32_t m_dvc_audio_dma_last_mac = 0;
 	uint32_t m_dvc_audio_dma_span_hint = 0;
 	double m_dvc_frame_rate_hz = 25.0;
+	u64 m_dvc_audio_dac_last_tick = 0;
 	u64 m_dvc_dclk_base = 0;
 };
 

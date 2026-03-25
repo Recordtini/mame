@@ -59,7 +59,6 @@ public:
 
 private:
 	struct limit_hit {};
-	struct invalid_header {};
 
 	struct band_info {
 		int modulo;
@@ -83,7 +82,6 @@ private:
 
 	int sampling_rate, last_frame_number;
 	int param_index, cbr_param_index;
-	int frame_bytes;
 
 	int channel_count, total_bands, joint_bands;
 
@@ -103,7 +101,6 @@ private:
 	void read_header_mpeg2(bool layer25);
 	void read_data_mpeg2();
 	void decode_mpeg2(short *output, int &output_samples);
-	bool next_header_plausible(int bitpos, int limit) const;
 
 	int get_band_param(int band);
 	void read_band_params();

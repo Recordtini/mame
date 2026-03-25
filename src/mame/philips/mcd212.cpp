@@ -320,12 +320,12 @@ int mcd212_device::get_border_width()
 
 int mcd212_device::get_dca_trigger_x()
 {
-	// The MCD212 docs describe DCA operating in the horizontal blanking area.
-	// For the 360/720-pixel mode, the right-side masked border is already part
-	// of blanking, so start DCA at the end of the active picture rather than
-	// after the border. Repeat Offender relies on these per-line display
-	// updates landing before the next visible line is mixed.
-	return get_screen_width();
+	// The MCD212/MiSTer DCA fetch starts when the active picture ends and
+	// horizontal blank begins, not at the far-right edge of the line. In the
+	// 360/720-pixel mode the right-side masked border is already part of the
+	// blanking interval, so trigger DCA before that area rather than at a late
+	// fixed X position.
+	return get_border_width() + get_screen_width();
 }
 
 uint32_t mcd212_device::get_backdrop_plane(int x, int y)

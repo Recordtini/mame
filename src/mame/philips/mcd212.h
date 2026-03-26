@@ -35,6 +35,44 @@ class mcd212_device : public device_t,
 					  public device_video_interface
 {
 public:
+	enum debug_layer_mask : uint8_t
+	{
+		DEBUG_LAYER_BACKDROP = 0x01,
+		DEBUG_LAYER_PLANE_A  = 0x02,
+		DEBUG_LAYER_PLANE_B  = 0x04,
+		DEBUG_LAYER_CURSOR   = 0x08,
+		DEBUG_LAYER_ALL      = DEBUG_LAYER_BACKDROP | DEBUG_LAYER_PLANE_A | DEBUG_LAYER_PLANE_B | DEBUG_LAYER_CURSOR
+	};
+
+	enum debug_video_mask : uint32_t
+	{
+		DEBUG_VIDEO_FORCE_EV_TOP = 0x01,
+		DEBUG_VIDEO_RAW_EV_ONLY  = 0x02,
+		DEBUG_VIDEO_REPLACE_A_EV = 0x04,
+		DEBUG_VIDEO_IGNORE_ALPHA = 0x08,
+		DEBUG_VIDEO_SWAP_TP_AB   = 0x10,
+		DEBUG_VIDEO_REPLACE_B_EV = 0x20,
+		DEBUG_VIDEO_YIELD_A_WB   = 0x40,
+		DEBUG_VIDEO_YIELD_B_WB   = 0x80,
+		DEBUG_VIDEO_FORCE_A_TOP  = 0x100,
+		DEBUG_VIDEO_FORCE_B_TOP  = 0x200,
+		DEBUG_VIDEO_LOG_SHOWNT   = 0x400,
+		DEBUG_VIDEO_YIELD_A_MF0  = 0x800,
+		DEBUG_VIDEO_YIELD_A_MF1  = 0x1000,
+		DEBUG_VIDEO_YIELD_B_MF0  = 0x2000,
+		DEBUG_VIDEO_YIELD_B_MF1  = 0x4000,
+		DEBUG_VIDEO_REPLACE_DOMINANT = 0x8000,
+		DEBUG_VIDEO_REPLACE_SPARSE   = 0x10000,
+		DEBUG_VIDEO_LOG_PLANE_STATS  = 0x20000
+	};
+
+	enum external_video_mode : uint8_t
+	{
+		EXTERNAL_VIDEO_BACKDROP = 0x00,
+		EXTERNAL_VIDEO_FORCE_TOP = 0x01,
+		EXTERNAL_VIDEO_BETWEEN_PLANES = 0x02
+	};
+
 	template <typename T, typename U>
 	mcd212_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock, T &&plane_a_tag, U &&plane_b_tag)
 		: mcd212_device(mconfig, tag, owner, clock)
@@ -48,9 +86,16 @@ public:
 	auto int_callback() { return m_int_callback.bind(); }
 
 	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
-	bitmap_rgb32 &external_video() { return m_external_video; }
+	bitmap_rgb32 &external_video() { return m_external_video_pending; }
 	void clear_external_video();
-	void set_external_video_enable(bool enable) { m_external_video_enabled = enable; }
+	void set_external_video_enable(bool enable);
+	void set_external_video_mode(uint8_t mode);
+	void set_debug_layer_mask(uint8_t mask);
+	void set_debug_video_mask(uint32_t mask);
+	bool external_video_pending_enabled() const { return m_external_video_pending_enabled; }
+	bool external_video_active_enabled() const { return m_external_video_active_enabled; }
+	bool external_video_dirty() const { return m_external_video_dirty; }
+	bool external_video_icm_enabled() const { return BIT(m_image_coding_method, ICM_EV_BIT); }
 
 	void map(address_map &map) ATTR_COLD;
 
@@ -206,13 +251,30 @@ protected:
 	uint32_t m_matte_control[8]{};
 	uint32_t m_backdrop_color = 0;
 	uint32_t m_mosaic_hold[2]{};
+	uint8_t m_base_weight_factor[2]{};
 	uint8_t m_weight_factor[2][768]{};
-	bitmap_rgb32 m_external_video;
-	bool m_external_video_enabled = false;
+	bitmap_rgb32 m_external_video_pending;
+	bitmap_rgb32 m_external_video_active;
+	bool m_external_video_pending_enabled = false;
+	bool m_external_video_active_enabled = false;
+	bool m_external_video_dirty = false;
+	uint8_t m_external_video_mode = EXTERNAL_VIDEO_BACKDROP;
+	uint8_t m_debug_layer_mask = DEBUG_LAYER_ALL;
+	uint32_t m_debug_video_mask = 0;
 	uint32_t m_ev_backdrop_hits = 0;
 	uint32_t m_ev_plane_a_hits = 0;
 	uint32_t m_ev_plane_b_hits = 0;
 	uint32_t m_ev_mixed_hits = 0;
+	uint32_t m_ev_replace_a_hits = 0;
+	uint32_t m_ev_replace_b_hits = 0;
+	uint32_t m_ev_yield_a_hits = 0;
+	uint32_t m_ev_yield_b_hits = 0;
+	uint32_t m_ev_src_a_hits = 0;
+	uint32_t m_ev_src_b_hits = 0;
+	uint32_t m_last_ev_log_signature = 0xffffffff;
+	uint32_t m_last_ev_log_nonblack = 0xffffffff;
+	uint32_t m_pending_vsr[2]{};
+	bool m_pending_vsr_valid[2]{};
 
 	// DYUV color limit arrays.
 	uint32_t m_dyuv_limit_lut[0x300];
@@ -247,6 +309,7 @@ protected:
 	bool m_matte_flag[2][768]{};
 	int m_ica_height = 0;
 	int m_total_height = 0;
+	int m_last_rendered_scanline = -1;
 	emu_timer *m_ica_timer = nullptr;
 	emu_timer *m_dca_timer = nullptr;
 
@@ -263,6 +326,7 @@ protected:
 	int get_screen_width();
 	int get_border_width();
 	int get_dca_trigger_x();
+	void log_external_video_state(const char *reason, bool force = false);
 	uint32_t get_backdrop_plane(int x, int y);
 
 	template <int Path> void set_vsr(uint32_t value);

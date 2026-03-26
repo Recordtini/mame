@@ -41,6 +41,7 @@ public:
 		, m_cdic(*this, "cdic")
 		, m_cdrom(*this, "cdrom")
 		, m_mcd212(*this, "mcd212")
+		, m_debug_layers(*this, "DEBUGLAY")
 		, m_dmadac(*this, "dvc_dac%u", 1U)
 	{ }
 
@@ -120,6 +121,7 @@ protected:
 	optional_device<cdicdic_device> m_cdic;
 	required_device<cdrom_image_device> m_cdrom;
 	required_device<mcd212_device> m_mcd212;
+		optional_ioport m_debug_layers;
 
 	required_device_array<dmadac_sound_device, 2> m_dmadac;
 
@@ -162,6 +164,8 @@ protected:
 	void dvc_update_irq_timer();
 	void dvc_update_video_timer();
 	void dvc_update_audio_timer();
+	void dvc_log_video_state(const char *reason, bool force = false);
+	void dvc_apply_video_show_mode();
 	void dvc_raise_fmv_irq(uint16_t bits);
 	void dvc_raise_fma_irq(uint16_t bits);
 	void dvc_handle_fmv_command(uint16_t data);
@@ -173,6 +177,8 @@ protected:
 	void dvc_process_demux_byte(bool video, uint8_t data);
 	void dvc_decode_video();
 	void dvc_decode_audio();
+	void dvc_update_audio_dac_fill();
+	void dvc_flush_audio_output(size_t max_samples = 0);
 	void dvc_present_next_frame();
 	void dvc_rebuild_external_video();
 
@@ -234,28 +240,43 @@ protected:
 	std::array<uint16_t, 0x1c00> m_dvc_fmv_program_ram{};
 	std::array<uint16_t, 0x40000> m_dvc_ram2{};
 
+	enum dvc_video_show_mode : uint8_t
+	{
+		DVC_SHOW_HIDDEN = 0,
+		DVC_SHOW_T = 1,
+		DVC_SHOW_NT = 2
+	};
+
 	bool m_dvc_decoder_enabled = false;
 	bool m_dvc_playback_active = false;
 	bool m_dvc_video_visible = false;
 	bool m_dvc_video_show_pending = false;
+	uint8_t m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
 	bool m_dvc_fmv_program_end_seen = false;
 	bool m_dvc_fma_started = false;
 	bool m_dvc_fma_pending_stream_change = false;
 	bool m_dvc_audio_output_active = false;
 	bool m_dvc_audio_output_started_once = false;
+	bool m_dvc_audio_last_decoded_valid = false;
 	bool m_dvc_fmv_register_update_latch = false;
 	bool m_dvc_fmv_register_update_scroll = false;
 	bool m_dvc_mpeg_ram_enabled = false;
 	bool m_cdic_irq_pending = false;
 	int16_t m_dvc_audio_output_level[2] = { 0, 0 };
+	int16_t m_dvc_audio_last_decoded[2] = { 0, 0 };
 	uint8_t m_dvc_mpeg_ram_enable_count = 0;
 	uint8_t m_dvc_dma_preview_count = 0;
 	uint16_t m_dvc_audio_empty_ticks = 0;
+	uint16_t m_dvc_last_video_log_frame_w = 0xffff;
+	uint16_t m_dvc_last_video_log_frame_h = 0xffff;
 	uint32_t m_dvc_video_present_accum = 0;
+	uint32_t m_dvc_last_video_log_signature = 0xffffffff;
 	uint32_t m_dvc_audio_sample_rate = 0;
+	uint32_t m_dvc_audio_dac_queued_samples = 0;
 	uint32_t m_dvc_audio_dma_last_mac = 0;
 	uint32_t m_dvc_audio_dma_span_hint = 0;
 	double m_dvc_frame_rate_hz = 25.0;
+	u64 m_dvc_audio_dac_last_tick = 0;
 	u64 m_dvc_dclk_base = 0;
 };
 

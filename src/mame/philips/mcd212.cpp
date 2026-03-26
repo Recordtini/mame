@@ -42,9 +42,188 @@ TODO:
 // device type definition
 DEFINE_DEVICE_TYPE(MCD212, mcd212_device, "mcd212", "MCD212 VDSC")
 
+namespace
+{
+	constexpr int32_t MCD212_VIDEO_BLACK_LEVEL = 0x10;
+
+	inline int32_t mcd212_weight_calc(const int32_t rgb, const uint8_t weight)
+	{
+		// Section 8.5 ("Overlay and Mixing") preserves the video black level by
+		// weighting RGB values around 16 rather than around 0.
+		return std::clamp(MCD212_VIDEO_BLACK_LEVEL + (((rgb - MCD212_VIDEO_BLACK_LEVEL) * int32_t(weight)) >> 6), 0, 255);
+	}
+
+	inline uint8_t mcd212_mix_weighted(const int32_t weighted_a, const int32_t weighted_b)
+	{
+		return std::clamp((weighted_a - MCD212_VIDEO_BLACK_LEVEL) + (weighted_b - MCD212_VIDEO_BLACK_LEVEL) + MCD212_VIDEO_BLACK_LEVEL, 0, 255);
+	}
+
+	inline bool mcd212_is_video_black(const int32_t r, const int32_t g, const int32_t b)
+	{
+		// Repeat-style titles appear to rely on planes yielding once they have
+		// been weighted down to video black, not only when they are mathematically
+		// zero. Allow a tiny tolerance around the nominal black level.
+		return (r <= (MCD212_VIDEO_BLACK_LEVEL + 2))
+			&& (g <= (MCD212_VIDEO_BLACK_LEVEL + 2))
+			&& (b <= (MCD212_VIDEO_BLACK_LEVEL + 2));
+	}
+
+	inline bool mcd212_fetch_ev_pixel(const bitmap_rgb32 &bitmap, const bool enabled, const bool ignore_alpha, const int x, const int y, uint32_t &pixel)
+	{
+		if (enabled && y >= 0 && y < bitmap.height() && x >= 0 && x < bitmap.width())
+		{
+			const uint32_t ev_pix = bitmap.pix(y, x);
+			if ((ev_pix >> 24) || (ignore_alpha && (ev_pix & 0x00ffffff)))
+			{
+				pixel = 0xff000000 | (ev_pix & 0x00ffffff);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline bool mcd212_eval_transparency(const uint8_t tp_ctrl, const bool use_color_key, const bool color_match, const bool rgb_tp_bit, const bool matte_flag)
+	{
+		switch (tp_ctrl)
+		{
+		case 0x0:
+			return true;
+		case 0x1:
+			return use_color_key && color_match;
+		case 0x2:
+			return rgb_tp_bit;
+		case 0x3:
+		case 0x4:
+			return matte_flag;
+		case 0x5:
+		case 0x6:
+			return matte_flag || (use_color_key && color_match);
+		case 0x8:
+			return false;
+		case 0x9:
+			return use_color_key && !color_match;
+		case 0xa:
+			return !rgb_tp_bit;
+		case 0xb:
+		case 0xc:
+			return !matte_flag;
+		case 0xd:
+		case 0xe:
+			return !matte_flag || (use_color_key && !color_match);
+		case 0x7:
+		case 0xf:
+		default:
+			return false;
+		}
+	}
+}
+
 inline ATTR_FORCE_INLINE uint8_t mcd212_device::get_weight_factor(const uint32_t matte_idx)
 {
 	return (uint8_t)((m_matte_control[matte_idx] & MC_WF) >> MC_WF_SHIFT);
+}
+
+void mcd212_device::set_external_video_enable(bool enable)
+{
+	if (m_external_video_pending_enabled != enable)
+	{
+		m_external_video_pending_enabled = enable;
+		m_external_video_dirty = true;
+		log_external_video_state(enable ? "pending enable on" : "pending enable off", true);
+	}
+	else
+	{
+		m_external_video_dirty = true;
+		log_external_video_state("pending enable unchanged");
+	}
+}
+
+void mcd212_device::set_external_video_mode(uint8_t mode)
+{
+	if (mode != EXTERNAL_VIDEO_FORCE_TOP && mode != EXTERNAL_VIDEO_BETWEEN_PLANES)
+		mode = EXTERNAL_VIDEO_BACKDROP;
+	if (m_external_video_mode != mode)
+	{
+		m_external_video_mode = mode;
+		m_last_rendered_scanline = m_ica_height - 1;
+		const char *const reason =
+			(mode == EXTERNAL_VIDEO_FORCE_TOP) ? "ev mode force top"
+			: (mode == EXTERNAL_VIDEO_BETWEEN_PLANES) ? "ev mode between planes"
+			: "ev mode backdrop";
+		log_external_video_state(reason, true);
+	}
+}
+
+void mcd212_device::set_debug_layer_mask(uint8_t mask)
+{
+	if (m_debug_layer_mask != mask)
+	{
+		m_debug_layer_mask = mask;
+		m_last_rendered_scanline = m_ica_height - 1;
+		log_external_video_state("debug layer mask", true);
+	}
+}
+
+void mcd212_device::set_debug_video_mask(uint32_t mask)
+{
+	if (m_debug_video_mask != mask)
+	{
+		m_debug_video_mask = mask;
+		m_last_rendered_scanline = m_ica_height - 1;
+		log_external_video_state("debug video mask", true);
+	}
+}
+
+void mcd212_device::log_external_video_state(const char *reason, bool force)
+{
+	uint32_t sample_nonblack = 0;
+	if (m_external_video_active.width() > 0 && m_external_video_active.height() > 0)
+	{
+		const size_t total_pixels = size_t(m_external_video_active.width()) * size_t(m_external_video_active.height());
+		const size_t step = std::max<size_t>(size_t(1), total_pixels / 256);
+		size_t index = 0;
+		for (int y = 0; y < m_external_video_active.height(); y++)
+		{
+			for (int x = 0; x < m_external_video_active.width(); x++, index++)
+			{
+				if ((index % step) != 0)
+					continue;
+				const uint32_t pixel = m_external_video_active.pix(y, x);
+				if (pixel & 0x00ffffff)
+					sample_nonblack++;
+			}
+		}
+	}
+
+	const uint32_t signature =
+		(m_external_video_pending_enabled ? 0x00000001 : 0x00000000) |
+		(m_external_video_active_enabled  ? 0x00000002 : 0x00000000) |
+		(m_external_video_dirty           ? 0x00000004 : 0x00000000) |
+		(BIT(m_image_coding_method, ICM_EV_BIT) ? 0x00000008 : 0x00000000) |
+		(uint32_t(m_debug_layer_mask) << 8) |
+		((uint32_t(m_debug_video_mask & 0xffff) << 16) ^ uint32_t(m_debug_video_mask >> 16));
+
+	if (!force && (signature == m_last_ev_log_signature) && (sample_nonblack == m_last_ev_log_nonblack))
+		return;
+
+	m_last_ev_log_signature = signature;
+	m_last_ev_log_nonblack = sample_nonblack;
+
+	logerror("MCD212 EV state [%s] pending=%d active=%d dirty=%d icm_ev=%d dbg_layers=%02x dbg_video=%05x sample_nonblack=%u dcr=%04x/%04x vsr=%04x/%04x dca=%06x/%06x\n",
+		reason,
+		m_external_video_pending_enabled ? 1 : 0,
+		m_external_video_active_enabled ? 1 : 0,
+		m_external_video_dirty ? 1 : 0,
+		BIT(m_image_coding_method, ICM_EV_BIT) ? 1 : 0,
+		m_debug_layer_mask,
+		m_debug_video_mask,
+		sample_nonblack,
+		m_dcr[0],
+		m_dcr[1],
+		m_vsr[0],
+		m_vsr[1],
+		m_dca[0],
+		m_dca[1]);
 }
 
 inline ATTR_FORCE_INLINE uint8_t mcd212_device::get_matte_op(const uint32_t matte_idx)
@@ -58,7 +237,7 @@ void mcd212_device::update_matte_arrays()
 	const int num_mattes = BIT(m_image_coding_method, ICM_NM_BIT) ? 2 : 1;
 
 	bool latched_mf[2]{ false, false };
-	uint8_t latched_wf[2] = { m_weight_factor[0][0], m_weight_factor[1][0] };
+	uint8_t latched_wf[2] = { m_base_weight_factor[0], m_base_weight_factor[1] };
 	int matte_idx[2] = { 0, 4 };
 
 	for (int x = 0; x < width; x++)
@@ -126,25 +305,41 @@ void mcd212_device::set_register(uint8_t reg, uint32_t value)
 			}
 			break;
 		case 0xc0: // Image Coding Method
-			if (Path == 0)
+			// MiSTer and the MCD212 register tables both model the shared display
+			// control registers as CH1-owned. Letting Path 1 overwrite them makes
+			// Repeat/Burger style popup scripts clobber the global EV state.
+			if (Path != 0)
 			{
-				LOGMASKED(LOG_REGISTERS, "%s: Path 0: Image Coding Method = %08x\n", machine().describe_context(), value);
-				m_image_coding_method = value;
+				logerror("%s: Scanline %d, Path %d attempted shared Image Coding Method write %08x (ignored)\n",
+					machine().describe_context(), screen().vpos(), Path, value);
+				break;
 			}
+			logerror("%s: Scanline %d, Path 0: Image Coding Method = %08x\n",
+				machine().describe_context(), screen().vpos(), value);
+			m_image_coding_method = value;
+			update_matte_arrays();
 			break;
 		case 0xc1: // Transparency Control
-			if (Path == 0)
+			if (Path != 0)
 			{
-				LOGMASKED(LOG_REGISTERS, "%s: Scanline %d, Path 0: Transparency Control = %08x\n", machine().describe_context(), screen().vpos(), value);
-				m_transparency_control = value;
+				logerror("%s: Scanline %d, Path %d attempted shared Transparency Control write %08x (ignored)\n",
+					machine().describe_context(), screen().vpos(), Path, value);
+				break;
 			}
+			logerror("%s: Scanline %d, Path 0: Transparency Control = %08x\n",
+				machine().describe_context(), screen().vpos(), value);
+			m_transparency_control = value;
 			break;
 		case 0xc2: // Plane Order
-			if (Path == 0)
+			if (Path != 0)
 			{
-				LOGMASKED(LOG_REGISTERS, "%s: Scanline %d, Path 0: Plane Order = %08x\n", machine().describe_context(), screen().vpos(), value & 7);
-				m_plane_order = value & 0x00000007;
+				logerror("%s: Scanline %d, Path %d attempted shared Plane Order write %08x (ignored)\n",
+					machine().describe_context(), screen().vpos(), Path, value & 7);
+				break;
 			}
+			logerror("%s: Scanline %d, Path 0: Plane Order = %08x\n",
+				machine().describe_context(), screen().vpos(), value & 7);
+			m_plane_order = value & 0x00000007;
 			break;
 		case 0xc3: // CLUT Bank Register
 			LOGMASKED(LOG_REGISTERS, "%s: Scanline %d, Path %d: CLUT Bank Register = %08x\n", machine().describe_context(), screen().vpos(), Path, value & 3);
@@ -226,11 +421,15 @@ void mcd212_device::set_register(uint8_t reg, uint32_t value)
 			update_matte_arrays();
 			break;
 		case 0xd8: // Backdrop Color
-			if (Path == 0)
+			if (Path != 0)
 			{
-				LOGMASKED(LOG_REGISTERS, "%s: Scanline %d, Path 0: Backdrop Color = %08x\n", machine().describe_context(), screen().vpos(), value);
-				m_backdrop_color = value;
+				logerror("%s: Scanline %d, Path %d attempted shared Backdrop Color write %08x (ignored)\n",
+					machine().describe_context(), screen().vpos(), Path, value);
+				break;
 			}
+			logerror("%s: Scanline %d, Path 0: Backdrop Color = %08x\n",
+				machine().describe_context(), screen().vpos(), value);
+			m_backdrop_color = value;
 			break;
 		case 0xd9: // Mosaic Pixel Hold Factor A
 			if (Path == 0)
@@ -250,7 +449,7 @@ void mcd212_device::set_register(uint8_t reg, uint32_t value)
 			if (Path == 0)
 			{
 				LOGMASKED(LOG_REGISTERS, "%s: Scanline %d, Path 0: Weight Factor A = %08x\n", machine().describe_context(), screen().vpos(), value);
-				m_weight_factor[0][0] = (uint8_t)value;
+				m_base_weight_factor[0] = (uint8_t)value;
 				update_matte_arrays();
 			}
 			break;
@@ -258,7 +457,7 @@ void mcd212_device::set_register(uint8_t reg, uint32_t value)
 			if (Path == 1)
 			{
 				LOGMASKED(LOG_REGISTERS, "%s: Scanline %d, Path 1: Weight Factor B = %08x\n", machine().describe_context(), screen().vpos(), value);
-				m_weight_factor[1][0] = (uint8_t)value;
+				m_base_weight_factor[1] = (uint8_t)value;
 				update_matte_arrays();
 			}
 			break;
@@ -330,22 +529,26 @@ int mcd212_device::get_dca_trigger_x()
 
 uint32_t mcd212_device::get_backdrop_plane(int x, int y)
 {
-	if (BIT(m_image_coding_method, ICM_EV_BIT))
+	if (!(m_debug_layer_mask & DEBUG_LAYER_BACKDROP))
+		return 0xff000000;
+
+	const uint32_t backdrop_color = s_4bpp_color[m_backdrop_color];
+	const bool ignore_ev_alpha = (m_debug_video_mask & DEBUG_VIDEO_IGNORE_ALPHA) != 0;
+	const bool ev_selected = BIT(m_image_coding_method, ICM_EV_BIT)
+		|| (m_external_video_active_enabled && (m_external_video_mode == EXTERNAL_VIDEO_BACKDROP));
+
+	if (ev_selected)
 	{
-		if (m_external_video_enabled
-			&& y >= 0 && y < m_external_video.height()
-			&& x >= 0 && x < m_external_video.width())
-		{
-			const uint32_t ev_pix = m_external_video.pix(y, x);
-			// 0 marks untouched EV pixels; real DVC video is always written with
-			// an opaque alpha channel.
-			if (ev_pix >> 24)
-				return ev_pix;
-		}
-		return 0;
+		uint32_t ev_pix = 0;
+		if (mcd212_fetch_ev_pixel(m_external_video_active, m_external_video_active_enabled, ignore_ev_alpha, x, y, ev_pix))
+			return ev_pix;
+		// External video replaces the normal backdrop. If the current EV pixel
+		// hasn't been written, fall back to the programmed backdrop color rather
+		// than forcing black, which can otherwise mask the intended overlay state.
+		return backdrop_color;
 	}
 	else
-		return s_4bpp_color[m_backdrop_color];
+		return backdrop_color;
 }
 
 template <int Path>
@@ -510,7 +713,9 @@ static inline uint8_t BYTE_TO_CLUT(int icm, uint8_t byte, bool clut_select)
 template <int Path>
 inline ATTR_FORCE_INLINE uint8_t mcd212_device::get_transparency_control()
 {
-	return (m_transparency_control >> (Path ? 8 : 0)) & 0x0f;
+	const bool swap_ab = (m_debug_video_mask & DEBUG_VIDEO_SWAP_TP_AB) != 0;
+	const int shift = (swap_ab ? !Path : Path) ? 8 : 0;
+	return (m_transparency_control >> shift) & 0x0f;
 }
 
 template <int Path>
@@ -541,9 +746,10 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 	const uint8_t icm = get_icm<Path>();
 	const uint8_t tp_ctrl = get_transparency_control<Path>();
 	const int width = get_screen_width();
-	// DCR2 does not have a DE bit; MiSTer also keys per-plane visibility from
-	// IC1/IC2 alone and uses DCR1.DE only for global display timing.
-	const bool path_enabled = BIT(m_dcr[Path], DCR_ICA_BIT);
+	// DCR1.DE is the global display/ICA-DCA gate; DCR2 does not have its own
+	// DE bit. A path cannot contribute picture data unless global display is
+	// enabled and that path's ICA is enabled.
+	const bool path_enabled = BIT(m_dcr[0], DCR_DE_BIT) && BIT(m_dcr[Path], DCR_ICA_BIT);
 
 	uint32_t vsr = get_vsr<Path>();
 	uint32_t vsr2 = get_vsr<!Path>();
@@ -558,7 +764,8 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 		// not contribute picture data and should not block the backdrop/FM V
 		// plane. Repeat Offender relies on this when it blanks the base planes
 		// and leaves EV enabled for full-screen video.
-		std::fill_n(transparent, width, !path_enabled || (tp_ctrl == TCR_ALWAYS) || !icm || !vsr);
+		const bool layer_enabled = BIT(m_debug_layer_mask, Path ? 2 : 1);
+		std::fill_n(transparent, width, !layer_enabled || !path_enabled || (tp_ctrl == TCR_ALWAYS) || !icm || !vsr);
 		return;
 	}
 
@@ -576,14 +783,12 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 	const uint32_t tp_color_match = m_transparent_color[Path] & mask_bits;
 	const uint8_t tp_ctrl_type = tp_ctrl & 0x07;
 
-	const bool use_rgb_tp_bit = (tp_ctrl_type == TCR_RGB);
-	const bool tp_check_parity = !BIT(tp_ctrl, 3);
-	const bool tp_always = ((tp_ctrl_type == TCR_ALWAYS) && tp_check_parity);
-	const int matte_flag_index = BIT(~tp_ctrl_type, 0);
-	const bool *const matte_flags = m_matte_flag[matte_flag_index];
-	const bool use_matte_flag = (tp_ctrl_type >= TCR_MF0 && tp_ctrl_type <= TCR_MF1_KEY1);
+	const bool *const matte_flags = m_matte_flag[(tp_ctrl_type == TCR_MF1 || tp_ctrl_type == TCR_MF1_KEY1) ? 1 : 0];
 	const bool is_dyuv_rgb = (icm == ICM_DYUV) || ((icm == ICM_RGB555) && (Path == 1)); // DYUV and RGB do not have access to color key.
-	const bool use_color_key = !is_dyuv_rgb && ((tp_ctrl_type == TCR_KEY) || (tp_ctrl_type == TCR_MF0_KEY1) || (tp_ctrl_type == TCR_MF1_KEY1));
+	const bool use_color_key = !is_dyuv_rgb
+		&& ((tp_ctrl == TCR_KEY) || (tp_ctrl == TCR_NOT_KEY)
+			|| (tp_ctrl == TCR_MF0_KEY1) || (tp_ctrl == TCR_MF1_KEY1)
+			|| (tp_ctrl == TCR_NOT_MF0_KEY) || (tp_ctrl == TCR_NOT_MF1_KEY));
 
 	LOGMASKED(LOG_VSR, "Scanline %d: VSR Path %d, ICM (%02x), VSR (%08x)\n", screen().vpos(), Path, icm, vsr);
 
@@ -620,10 +825,10 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 			pixels[x + 1] = color0;
 			pixels[x + 2] = color1;
 			pixels[x + 3] = color1;
-			transparent[x    ] = tp_always || (use_matte_flag && (matte_flags[x    ] == tp_check_parity));
-			transparent[x + 1] = tp_always || (use_matte_flag && (matte_flags[x + 1] == tp_check_parity));
-			transparent[x + 2] = tp_always || (use_matte_flag && (matte_flags[x + 2] == tp_check_parity));
-			transparent[x + 3] = tp_always || (use_matte_flag && (matte_flags[x + 3] == tp_check_parity));
+			for (int i = 0; i < 4; i++)
+			{
+				transparent[x + i] = mcd212_eval_transparency(tp_ctrl, false, false, false, matte_flags[x + i]);
+			}
 			x += 4;
 		}
 		else
@@ -635,7 +840,7 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 				const uint8_t blue = (byte & 0b11111) << 3;
 				const uint8_t green = ((byte & 0b11100000) >> 2) + ((byte1 & 0b11) << 6);
 				const uint8_t red = (byte1 & 0b01111100) << 1;
-				rgb_tp_bit = (use_rgb_tp_bit && (BIT(byte1,7) == tp_check_parity));
+				rgb_tp_bit = BIT(byte1, 7);
 				color1 = color0 = (uint32_t(red) << 16) | (uint32_t(green) << 8) | blue;
 			}
 			else if (icm == ICM_CLUT4)
@@ -656,15 +861,19 @@ void mcd212_device::process_vsr(uint32_t *pixels, bool *transparent)
 				length_m = length ? (length * 2) : width;
 			}
 
-			const bool color_match0 = ((mask_bits & color0) == tp_color_match) == tp_check_parity;
-			const bool color_match1 = ((mask_bits & color1) == tp_color_match) == tp_check_parity;
+			const bool color_match0 = ((mask_bits & color0) == tp_color_match);
+			const bool color_match1 = ((mask_bits & color1) == tp_color_match);
 			const int end = std::min<int>(width, x + length_m);
 			for (int rl_index = x; rl_index < end; rl_index += 2)
 			{
 				pixels[rl_index    ] = color0;
 				pixels[rl_index + 1] = color1;
-				transparent[rl_index    ] = tp_always || rgb_tp_bit || (use_color_key && color_match0) || (use_matte_flag && (matte_flags[rl_index    ] == tp_check_parity));
-				transparent[rl_index + 1] = tp_always || rgb_tp_bit || (use_color_key && color_match1) || (use_matte_flag && (matte_flags[rl_index + 1] == tp_check_parity));
+				auto eval_transparency = [tp_ctrl, use_color_key, rgb_tp_bit, matte_flags](int idx, bool color_match)
+				{
+					return mcd212_eval_transparency(tp_ctrl, use_color_key, color_match, rgb_tp_bit, matte_flags[idx]);
+				};
+				transparent[rl_index    ] = eval_transparency(rl_index, color_match0);
+				transparent[rl_index + 1] = eval_transparency(rl_index + 1, color_match1);
 			}
 			x = end;
 		}
@@ -706,35 +915,53 @@ void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *
 	uint32_t plane_a_hits = 0;
 	uint32_t plane_b_hits = 0;
 	uint32_t mixed_hits = 0;
+	uint32_t line_visible_a = 0;
+	uint32_t line_visible_b = 0;
+
+	for (int i = 0; i < width; i++)
+	{
+		if (BIT(m_debug_layer_mask, 1) && !transparent_a[i])
+			line_visible_a++;
+		if (BIT(m_debug_layer_mask, 2) && !transparent_b[i])
+			line_visible_b++;
+	}
 
 	for (int x = 0; x < width; x++)
 	{
-		if (transparent_a[x] && transparent_b[x])
-		{
-			backdrop_hits++;
-			out[x] = get_backdrop_plane(x, y);
-			continue;
-		}
 		uint32_t plane_a_cur = MosaicA ? plane_a[x - (x % mosaic_count_a)] : plane_a[x];
 		uint32_t plane_b_cur = MosaicB ? plane_b[x - (x % mosaic_count_b)] : plane_b[x];
 
-		if (transparent_a[x])
+		bool plane_a_visible = BIT(m_debug_layer_mask, 1) && !transparent_a[x];
+		bool plane_b_visible = BIT(m_debug_layer_mask, 2) && !transparent_b[x];
+		uint32_t ev_pix = 0;
+		const bool ignore_ev_alpha = (m_debug_video_mask & DEBUG_VIDEO_IGNORE_ALPHA) != 0;
+		const bool raw_ev_present = mcd212_fetch_ev_pixel(m_external_video_active, m_external_video_active_enabled, ignore_ev_alpha, x, y, ev_pix);
+		const bool force_ev_base = (m_external_video_mode == EXTERNAL_VIDEO_FORCE_TOP) && raw_ev_present;
+		const bool ev_between_planes = (m_external_video_mode == EXTERNAL_VIDEO_BETWEEN_PLANES) && raw_ev_present;
+		bool replace_plane_a_with_ev = ev_between_planes && (icmA == ICM_DYUV) && (icmB != ICM_DYUV);
+		bool replace_plane_b_with_ev = ev_between_planes && (icmB == ICM_DYUV) && (icmA != ICM_DYUV);
+
+		if ((m_debug_video_mask & DEBUG_VIDEO_RAW_EV_ONLY) != 0)
 		{
-			plane_a_cur = 0;
-		}
-		else if (OrderAB && (m_transparency_control & TCR_DISABLE_MX))
-		{
-			plane_b_cur = 0;
+			out[x] = raw_ev_present ? ev_pix : 0xff000000;
+			backdrop_hits++;
+			continue;
 		}
 
-		if (transparent_b[x])
+		if ((m_debug_video_mask & DEBUG_VIDEO_FORCE_EV_TOP) != 0 && raw_ev_present)
 		{
-			plane_b_cur = 0;
+			out[x] = ev_pix;
+			backdrop_hits++;
+			continue;
 		}
-		else if (!OrderAB && (m_transparency_control & TCR_DISABLE_MX))
-		{
+
+		if (!plane_a_visible)
 			plane_a_cur = 0;
-		}
+		if (!plane_b_visible)
+			plane_b_cur = 0;
+
+		const bool matte_flag0 = m_matte_flag[0][x];
+		const bool matte_flag1 = m_matte_flag[1][x];
 
 		const int32_t plane_a_r = 0xff & (plane_a_cur >> 16);
 		const int32_t plane_a_g = 0xff & (plane_a_cur >> 8);
@@ -743,27 +970,338 @@ void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *
 		const int32_t plane_b_g = 0xff & (plane_b_cur >> 8);
 		const int32_t plane_b_b = 0xff & plane_b_cur;
 
-		const int32_t weighted_a_r = std::clamp((std::clamp(plane_a_r - 16, 0, 255) * weight_a[x]) >> 6, 0, 255);
-		const int32_t weighted_a_g = std::clamp((std::clamp(plane_a_g - 16, 0, 255) * weight_a[x]) >> 6, 0, 255);
-		const int32_t weighted_a_b = std::clamp((std::clamp(plane_a_b - 16, 0, 255) * weight_a[x]) >> 6, 0, 255);
+		const int32_t weighted_a_r = mcd212_weight_calc(plane_a_r, weight_a[x]);
+		const int32_t weighted_a_g = mcd212_weight_calc(plane_a_g, weight_a[x]);
+		const int32_t weighted_a_b = mcd212_weight_calc(plane_a_b, weight_a[x]);
 
-		const int32_t weighted_b_r = std::clamp((std::clamp(plane_b_r - 16, 0, 255) * weight_b[x]) >> 6, 0, 255);
-		const int32_t weighted_b_g = std::clamp((std::clamp(plane_b_g - 16, 0, 255) * weight_b[x]) >> 6, 0, 255);
-		const int32_t weighted_b_b = std::clamp((std::clamp(plane_b_b - 16, 0, 255) * weight_b[x]) >> 6, 0, 255);
+		const int32_t weighted_b_r = mcd212_weight_calc(plane_b_r, weight_b[x]);
+		const int32_t weighted_b_g = mcd212_weight_calc(plane_b_g, weight_b[x]);
+		const int32_t weighted_b_b = mcd212_weight_calc(plane_b_b, weight_b[x]);
 
-		const uint8_t out_r = std::clamp(weighted_a_r + weighted_b_r + 16, 0, 255);
-		const uint8_t out_g = std::clamp(weighted_a_g + weighted_b_g + 16, 0, 255);
-		const uint8_t out_b = std::clamp(weighted_a_b + weighted_b_b + 16, 0, 255);
-		out[x] = 0xff000000 | (out_r << 16) | (out_g << 8) | out_b;
-		if (!transparent_a[x] && !transparent_b[x])
+		const bool source_a_is_video_black = mcd212_is_video_black(plane_a_r, plane_a_g, plane_a_b);
+		const bool source_b_is_video_black = mcd212_is_video_black(plane_b_r, plane_b_g, plane_b_b);
+		const bool weighted_a_is_video_black = mcd212_is_video_black(weighted_a_r, weighted_a_g, weighted_a_b);
+		const bool weighted_b_is_video_black = mcd212_is_video_black(weighted_b_r, weighted_b_g, weighted_b_b);
+
+		if ((m_debug_video_mask & DEBUG_VIDEO_YIELD_A_WB) && plane_a_visible && weighted_a_is_video_black && !source_a_is_video_black)
+		{
+			plane_a_visible = false;
+			m_ev_yield_a_hits++;
+		}
+		if ((m_debug_video_mask & DEBUG_VIDEO_YIELD_B_WB) && plane_b_visible && weighted_b_is_video_black && !source_b_is_video_black)
+		{
+			plane_b_visible = false;
+			m_ev_yield_b_hits++;
+		}
+		if ((m_debug_video_mask & DEBUG_VIDEO_YIELD_A_MF0) && plane_a_visible && matte_flag0)
+		{
+			plane_a_visible = false;
+			m_ev_yield_a_hits++;
+		}
+		if ((m_debug_video_mask & DEBUG_VIDEO_YIELD_A_MF1) && plane_a_visible && matte_flag1)
+		{
+			plane_a_visible = false;
+			m_ev_yield_a_hits++;
+		}
+		if ((m_debug_video_mask & DEBUG_VIDEO_YIELD_B_MF0) && plane_b_visible && matte_flag0)
+		{
+			plane_b_visible = false;
+			m_ev_yield_b_hits++;
+		}
+		if ((m_debug_video_mask & DEBUG_VIDEO_YIELD_B_MF1) && plane_b_visible && matte_flag1)
+		{
+			plane_b_visible = false;
+			m_ev_yield_b_hits++;
+		}
+
+		bool shownt_order_ab = OrderAB;
+		if (m_debug_video_mask & DEBUG_VIDEO_FORCE_A_TOP)
+			shownt_order_ab = true;
+		if (m_debug_video_mask & DEBUG_VIDEO_FORCE_B_TOP)
+			shownt_order_ab = false;
+
+		if (ev_between_planes)
+		{
+			if (m_debug_video_mask & DEBUG_VIDEO_REPLACE_A_EV)
+			{
+				replace_plane_a_with_ev = true;
+				replace_plane_b_with_ev = false;
+			}
+			if (m_debug_video_mask & DEBUG_VIDEO_REPLACE_B_EV)
+			{
+				replace_plane_b_with_ev = true;
+				replace_plane_a_with_ev = false;
+			}
+			if (m_debug_video_mask & DEBUG_VIDEO_REPLACE_DOMINANT)
+			{
+				if (line_visible_a > line_visible_b)
+				{
+					replace_plane_a_with_ev = true;
+					replace_plane_b_with_ev = false;
+				}
+				else if (line_visible_b > line_visible_a)
+				{
+					replace_plane_b_with_ev = true;
+					replace_plane_a_with_ev = false;
+				}
+			}
+			if (m_debug_video_mask & DEBUG_VIDEO_REPLACE_SPARSE)
+			{
+				if (line_visible_a && line_visible_b)
+				{
+					if (line_visible_a < line_visible_b)
+					{
+						replace_plane_a_with_ev = true;
+						replace_plane_b_with_ev = false;
+					}
+					else if (line_visible_b < line_visible_a)
+					{
+						replace_plane_b_with_ev = true;
+						replace_plane_a_with_ev = false;
+					}
+				}
+				else if (line_visible_a)
+				{
+					replace_plane_a_with_ev = true;
+					replace_plane_b_with_ev = false;
+				}
+				else if (line_visible_b)
+				{
+					replace_plane_b_with_ev = true;
+					replace_plane_a_with_ev = false;
+				}
+			}
+			if ((m_debug_video_mask & DEBUG_VIDEO_LOG_PLANE_STATS) != 0)
+			{
+				logerror("MCD212 EV line y=%d vis_a=%u vis_b=%u mf0=%d mf1=%d rep_a=%d rep_b=%d order=%c icm=%x/%x\n",
+					y,
+					line_visible_a,
+					line_visible_b,
+					matte_flag0 ? 1 : 0,
+					matte_flag1 ? 1 : 0,
+					replace_plane_a_with_ev ? 1 : 0,
+					replace_plane_b_with_ev ? 1 : 0,
+					shownt_order_ab ? 'A' : 'B',
+					icmA,
+					icmB);
+			}
+			if (replace_plane_a_with_ev)
+				m_ev_src_a_hits++;
+			if (replace_plane_b_with_ev)
+				m_ev_src_b_hits++;
+		}
+
+		if (!plane_a_visible && !plane_b_visible)
+		{
+			backdrop_hits++;
+			out[x] = (force_ev_base || ev_between_planes) ? ev_pix : get_backdrop_plane(x, y);
+			continue;
+		}
+
+		if (ev_between_planes)
+		{
+			// Burger King / Repeat-style titles appear to keep a DYUV "video
+			// screen" asset alive on one CD-i plane while the other plane carries
+			// popup/player overlays. In SHOW_NT mode, the decoded MPEG video should
+			// replace whichever plane is currently being used as that DYUV
+			// placeholder, while the opposite plane remains available above it.
+			if (replace_plane_a_with_ev)
+			{
+				if (plane_b_visible)
+				{
+					plane_b_hits++;
+					out[x] = 0xff000000
+						| (weighted_b_r << 16)
+						| (weighted_b_g << 8)
+						| weighted_b_b;
+				}
+				else if (raw_ev_present)
+				{
+					backdrop_hits++;
+					m_ev_replace_a_hits++;
+					out[x] = ev_pix;
+				}
+				else if (plane_a_visible)
+				{
+					plane_a_hits++;
+					out[x] = 0xff000000
+						| (weighted_a_r << 16)
+						| (weighted_a_g << 8)
+						| weighted_a_b;
+				}
+				else
+				{
+					backdrop_hits++;
+					out[x] = get_backdrop_plane(x, y);
+				}
+				continue;
+			}
+
+			if (replace_plane_b_with_ev)
+			{
+				if (plane_a_visible)
+				{
+					plane_a_hits++;
+					out[x] = 0xff000000
+						| (weighted_a_r << 16)
+						| (weighted_a_g << 8)
+						| weighted_a_b;
+				}
+				else if (raw_ev_present)
+				{
+					backdrop_hits++;
+					m_ev_replace_b_hits++;
+					out[x] = ev_pix;
+				}
+				else if (plane_b_visible)
+				{
+					plane_b_hits++;
+					out[x] = 0xff000000
+						| (weighted_b_r << 16)
+						| (weighted_b_g << 8)
+						| weighted_b_b;
+				}
+				else
+				{
+					backdrop_hits++;
+					out[x] = get_backdrop_plane(x, y);
+				}
+				continue;
+			}
+
+			// If neither plane is the obvious DYUV placeholder, fall back to the
+			// current plane order and insert EV between the front and back planes.
+			if (shownt_order_ab)
+			{
+				if (plane_a_visible)
+				{
+					plane_a_hits++;
+					out[x] = 0xff000000
+						| (weighted_a_r << 16)
+						| (weighted_a_g << 8)
+						| weighted_a_b;
+				}
+				else if (raw_ev_present)
+				{
+					backdrop_hits++;
+					out[x] = ev_pix;
+				}
+				else if (plane_b_visible)
+				{
+					plane_b_hits++;
+					out[x] = 0xff000000
+						| (weighted_b_r << 16)
+						| (weighted_b_g << 8)
+						| weighted_b_b;
+				}
+				else
+				{
+					backdrop_hits++;
+					out[x] = get_backdrop_plane(x, y);
+				}
+			}
+			else
+			{
+				if (plane_b_visible)
+				{
+					plane_b_hits++;
+					out[x] = 0xff000000
+						| (weighted_b_r << 16)
+						| (weighted_b_g << 8)
+						| weighted_b_b;
+				}
+				else if (raw_ev_present)
+				{
+					backdrop_hits++;
+					out[x] = ev_pix;
+				}
+				else if (plane_a_visible)
+				{
+					plane_a_hits++;
+					out[x] = 0xff000000
+						| (weighted_a_r << 16)
+						| (weighted_a_g << 8)
+						| weighted_a_b;
+				}
+				else
+				{
+					backdrop_hits++;
+					out[x] = get_backdrop_plane(x, y);
+				}
+			}
+			continue;
+		}
+
+		if (m_transparency_control & TCR_DISABLE_MX)
+		{
+			if (OrderAB)
+			{
+				if (plane_a_visible)
+				{
+					plane_a_hits++;
+					out[x] = 0xff000000
+						| (weighted_a_r << 16)
+						| (weighted_a_g << 8)
+						| weighted_a_b;
+				}
+				else
+				{
+					plane_b_hits++;
+					out[x] = 0xff000000
+						| (weighted_b_r << 16)
+						| (weighted_b_g << 8)
+						| weighted_b_b;
+				}
+			}
+			else
+			{
+				if (plane_b_visible)
+				{
+					plane_b_hits++;
+					out[x] = 0xff000000
+						| (weighted_b_r << 16)
+						| (weighted_b_g << 8)
+						| weighted_b_b;
+				}
+				else
+				{
+					plane_a_hits++;
+					out[x] = 0xff000000
+						| (weighted_a_r << 16)
+						| (weighted_a_g << 8)
+						| weighted_a_b;
+				}
+			}
+			continue;
+		}
+
+		if (plane_a_visible && plane_b_visible)
+		{
 			mixed_hits++;
-		else if (!transparent_a[x])
+			const uint8_t out_r = mcd212_mix_weighted(weighted_a_r, weighted_b_r);
+			const uint8_t out_g = mcd212_mix_weighted(weighted_a_g, weighted_b_g);
+			const uint8_t out_b = mcd212_mix_weighted(weighted_a_b, weighted_b_b);
+			out[x] = 0xff000000 | (out_r << 16) | (out_g << 8) | out_b;
+		}
+		else if (plane_a_visible)
+		{
 			plane_a_hits++;
+			out[x] = 0xff000000
+				| (weighted_a_r << 16)
+				| (weighted_a_g << 8)
+				| weighted_a_b;
+		}
 		else
+		{
 			plane_b_hits++;
+			out[x] = 0xff000000
+				| (weighted_b_r << 16)
+				| (weighted_b_g << 8)
+				| weighted_b_b;
+		}
 	}
 
-	if (m_external_video_enabled && BIT(m_image_coding_method, ICM_EV_BIT))
+	if (m_external_video_active_enabled && BIT(m_image_coding_method, ICM_EV_BIT))
 	{
 		m_ev_backdrop_hits += backdrop_hits;
 		m_ev_plane_a_hits += plane_a_hits;
@@ -779,6 +1317,9 @@ void mcd212_device::mix_lines(uint32_t *plane_a, bool *transparent_a, uint32_t *
 
 void mcd212_device::draw_cursor(uint32_t *scanline)
 {
+	if (!(m_debug_layer_mask & DEBUG_LAYER_CURSOR))
+		return;
+
 	if (!(m_cursor_control & CURCNT_EN))
 		return; // Cursor is Disabled
 
@@ -843,6 +1384,7 @@ void mcd212_device::csr1_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	LOGMASKED(LOG_MAIN_REG_WRITES, "%s: Control/Status Register 1 Write: %04x & %08x\n", machine().describe_context(), data, mem_mask);
 	COMBINE_DATA(&m_csrw[0]);
+	update_matte_arrays();
 }
 
 uint16_t mcd212_device::dcr1_r(offs_t offset, uint16_t mem_mask)
@@ -855,6 +1397,7 @@ void mcd212_device::dcr1_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	LOGMASKED(LOG_MAIN_REG_WRITES, "%s: Display Command Register 1 Write: %04x & %08x\n", machine().describe_context(), data, mem_mask);
 	COMBINE_DATA(&m_dcr[0]);
+	update_matte_arrays();
 }
 
 uint16_t mcd212_device::vsr1_r(offs_t offset, uint16_t mem_mask)
@@ -967,6 +1510,9 @@ void mcd212_device::dca2_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 TIMER_CALLBACK_MEMBER(mcd212_device::ica_tick)
 {
 	m_csrr[0] &= ~CSR1R_DA;
+	m_last_rendered_scanline = m_ica_height - 1;
+	m_pending_vsr_valid[0] = false;
+	m_pending_vsr_valid[1] = false;
 
 	// Process ICA
 	if (BIT(m_dcr[0], DCR_ICA_BIT))
@@ -974,9 +1520,9 @@ TIMER_CALLBACK_MEMBER(mcd212_device::ica_tick)
 	if (BIT(m_dcr[1], DCR_ICA_BIT))
 		process_ica<1>();
 
-	if (BIT(m_dcr[0], DCR_DCA_BIT))
+	if (BIT(m_dcr[0], DCR_DE_BIT) && BIT(m_dcr[0], DCR_DCA_BIT))
 		m_dca[0] = get_dcp<0>();
-	if (BIT(m_dcr[1], DCR_DCA_BIT))
+	if (BIT(m_dcr[0], DCR_DE_BIT) && BIT(m_dcr[1], DCR_DCA_BIT))
 		m_dca[1] = get_dcp<1>();
 
 	m_ica_timer->adjust(screen().time_until_pos(0, 0));
@@ -999,12 +1545,6 @@ TIMER_CALLBACK_MEMBER(mcd212_device::ica_tick)
 
 TIMER_CALLBACK_MEMBER(mcd212_device::dca_tick)
 {
-	// Process DCA
-	if (BIT(m_dcr[0], DCR_DCA_BIT))
-		process_dca<0>();
-	if (BIT(m_dcr[1], DCR_DCA_BIT))
-		process_dca<1>();
-
 	int scanline = screen().vpos();
 	const int dca_x = get_dca_trigger_x();
 	if (scanline == m_total_height - 1)
@@ -1025,18 +1565,51 @@ uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 		return 0; // Do nothing on the extended rows.
 	}
 
-	// FIXME this should use the clipping rectangle to determine which lines need drawing
-	int scanline = screen.vpos();
+	if (screen.vpos() < m_last_rendered_scanline)
+		m_last_rendered_scanline = m_ica_height - 1;
 
-	// Process VSR and mix if we're in the visible region
-	if (scanline >= m_ica_height)
+	const int start_scanline = std::max(m_ica_height, m_last_rendered_scanline + 1);
+	const int end_scanline = std::min(screen.vpos(), m_total_height - 1);
+
+	for (int scanline = start_scanline; scanline <= end_scanline; scanline++)
 	{
+		const bool dca_enabled_0 = BIT(m_dcr[0], DCR_DE_BIT) && BIT(m_dcr[0], DCR_DCA_BIT);
+		const bool dca_enabled_1 = BIT(m_dcr[0], DCR_DE_BIT) && BIT(m_dcr[1], DCR_DCA_BIT);
+		const bool synthetic_pal_border = !BIT(m_dcr[0], DCR_FD_BIT) && BIT(m_csrw[0], CSR1W_ST_BIT);
+
 		if (scanline == m_ica_height)
 		{
 			m_ev_backdrop_hits = 0;
 			m_ev_plane_a_hits = 0;
 			m_ev_plane_b_hits = 0;
 			m_ev_mixed_hits = 0;
+			m_ev_replace_a_hits = 0;
+			m_ev_replace_b_hits = 0;
+			m_ev_yield_a_hits = 0;
+			m_ev_yield_b_hits = 0;
+			m_ev_src_a_hits = 0;
+			m_ev_src_b_hits = 0;
+			if (m_external_video_dirty)
+			{
+				const bool active_enable_changed = (m_external_video_active_enabled != m_external_video_pending_enabled);
+				copybitmap(m_external_video_active, m_external_video_pending, 0, 0, 0, 0, rectangle(0, m_external_video_pending.width() - 1, 0, m_external_video_pending.height() - 1));
+				m_external_video_active_enabled = m_external_video_pending_enabled;
+				m_external_video_dirty = false;
+				if (active_enable_changed)
+					m_last_rendered_scanline = m_ica_height - 1;
+				log_external_video_state("frame apply", true);
+			}
+
+			// DCA state is fetched during horizontal retrace. If there is no
+			// synthetic top border, prime once here so the first visible line of
+			// the new field doesn't use stale pre-field control data.
+			if (!synthetic_pal_border)
+			{
+				if (dca_enabled_0)
+					process_dca<0>();
+				if (dca_enabled_1)
+					process_dca<1>();
+			}
 		}
 
 		uint32_t const bitmap_line = ((scanline - m_ica_height) << 1) + m_ica_height;
@@ -1058,7 +1631,6 @@ uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 
 		if (draw_line)
 		{
-
 			process_vsr<0>(plane_a, transparent_a);
 			process_vsr<1>(plane_b, transparent_b);
 
@@ -1108,23 +1680,42 @@ uint32_t mcd212_device::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 			std::copy_n(out, 768, out2);
 		}
 
-		if ((scanline == (m_total_height - 1)) && m_external_video_enabled && BIT(m_image_coding_method, ICM_EV_BIT))
+		// DCA is fetched during horizontal retrace and affects the following
+		// line. The MCD212 keeps advancing line-control during blanking as well,
+		// so do not stall it on the synthetic PAL top/bottom border lines that
+		// MAME inserts for display purposes.
+		if (dca_enabled_0)
+			process_dca<0>();
+		if (dca_enabled_1)
+			process_dca<1>();
+
+		if ((scanline == (m_total_height - 1)) && m_external_video_active_enabled && BIT(m_image_coding_method, ICM_EV_BIT))
 		{
-			logerror("MCD212 EV summary backdrop=%u plane_a=%u plane_b=%u mixed=%u icm=%06x tcr=%06x dcr=%04x/%04x order=%u\n",
+			logerror("MCD212 EV summary backdrop=%u plane_a=%u plane_b=%u mixed=%u repl_a=%u repl_b=%u yield_a=%u yield_b=%u src_a=%u src_b=%u icm=%06x tcr=%06x dcr=%04x/%04x order=%u dbg=%05x\n",
 				m_ev_backdrop_hits,
 				m_ev_plane_a_hits,
 				m_ev_plane_b_hits,
 				m_ev_mixed_hits,
+				m_ev_replace_a_hits,
+				m_ev_replace_b_hits,
+				m_ev_yield_a_hits,
+				m_ev_yield_b_hits,
+				m_ev_src_a_hits,
+				m_ev_src_b_hits,
 				m_image_coding_method,
 				m_transparency_control,
 				m_dcr[0],
 				m_dcr[1],
-				m_plane_order);
+				m_plane_order,
+				m_debug_video_mask);
 		}
 	}
 
+	if (end_scanline >= start_scanline)
+		m_last_rendered_scanline = end_scanline;
+
 	// Toggle frame parity at the end of the visible frame (even in non-interlaced mode).
-	if (scanline == (m_total_height - 1))
+	if (end_scanline == (m_total_height - 1))
 	{
 		m_csrr[0] ^= CSR1R_PA;
 	}
@@ -1203,13 +1794,29 @@ void mcd212_device::device_reset()
 	std::fill_n(m_matte_control, 8, 0);
 	m_backdrop_color = 0;
 	std::fill_n(m_mosaic_hold, 2, 0);
+	std::fill_n(m_base_weight_factor, 2, 0);
 	std::fill_n(m_weight_factor[0], std::size(m_weight_factor[0]), 0);
 	std::fill_n(m_weight_factor[1], std::size(m_weight_factor[1]), 0);
 	std::fill_n(m_matte_flag[0], std::size(m_matte_flag[0]), false);
 	std::fill_n(m_matte_flag[1], std::size(m_matte_flag[1]), false);
+	std::fill_n(m_pending_vsr, 2, 0);
+	std::fill_n(m_pending_vsr_valid, 2, false);
+	m_external_video_pending_enabled = false;
+	m_external_video_active_enabled = false;
+	m_external_video_dirty = false;
+	m_external_video_mode = EXTERNAL_VIDEO_BACKDROP;
+	m_ev_replace_a_hits = 0;
+	m_ev_replace_b_hits = 0;
+	m_ev_yield_a_hits = 0;
+	m_ev_yield_b_hits = 0;
+	m_ev_src_a_hits = 0;
+	m_ev_src_b_hits = 0;
+	m_external_video_pending.fill(0x00000000);
+	m_external_video_active.fill(0x00000000);
 
 	m_ica_height = 32;
 	m_total_height = 312;
+	m_last_rendered_scanline = m_ica_height - 1;
 	m_blink_time = 0;
 	for (int i = 0; i < m_total_height; i++)
 	{
@@ -1243,8 +1850,10 @@ void mcd212_device::device_start()
 {
 	static const uint8_t s_dyuv_deltas[16] = { 0, 1, 4, 9, 16, 27, 44, 79, 128, 177, 212, 229, 240, 247, 252, 255 };
 
-	m_external_video.allocate(768, 312);
+	m_external_video_pending.allocate(768, 312);
+	m_external_video_active.allocate(768, 312);
 	clear_external_video();
+	m_external_video_active.fill(0x00000000);
 
 	for (uint16_t d = 0; d < 0x100; d++)
 	{
@@ -1287,20 +1896,35 @@ void mcd212_device::device_start()
 	save_item(NAME(m_matte_control));
 	save_item(NAME(m_backdrop_color));
 	save_item(NAME(m_mosaic_hold));
+	save_item(NAME(m_base_weight_factor));
 	save_item(NAME(m_weight_factor[0]));
 	save_item(NAME(m_weight_factor[1]));
 
 	save_item(NAME(m_matte_flag));
 	save_item(NAME(m_ica_height));
 	save_item(NAME(m_total_height));
+	save_item(NAME(m_last_rendered_scanline));
 
 	save_item(NAME(m_blink_time));
 	save_item(NAME(m_blink_active));
-	save_item(NAME(m_external_video_enabled));
+	save_item(NAME(m_external_video_pending_enabled));
+	save_item(NAME(m_external_video_active_enabled));
+	save_item(NAME(m_external_video_dirty));
+	save_item(NAME(m_external_video_mode));
+	save_item(NAME(m_debug_layer_mask));
+	save_item(NAME(m_debug_video_mask));
 	save_item(NAME(m_ev_backdrop_hits));
 	save_item(NAME(m_ev_plane_a_hits));
 	save_item(NAME(m_ev_plane_b_hits));
 	save_item(NAME(m_ev_mixed_hits));
+	save_item(NAME(m_ev_replace_a_hits));
+	save_item(NAME(m_ev_replace_b_hits));
+	save_item(NAME(m_ev_yield_a_hits));
+	save_item(NAME(m_ev_yield_b_hits));
+	save_item(NAME(m_ev_src_a_hits));
+	save_item(NAME(m_ev_src_b_hits));
+	save_item(NAME(m_pending_vsr));
+	save_item(NAME(m_pending_vsr_valid));
 
 	save_item(NAME(m_interlace_field));
 
@@ -1315,5 +1939,6 @@ void mcd212_device::clear_external_video()
 {
 	// Keep unwritten EV pixels distinguishable from drawn DVC video so the
 	// backdrop path can ignore untouched areas cleanly.
-	m_external_video.fill(0x00000000);
+	m_external_video_pending.fill(0x00000000);
+	m_external_video_dirty = true;
 }

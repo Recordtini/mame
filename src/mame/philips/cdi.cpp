@@ -78,6 +78,15 @@ constexpr size_t DVC_PLM_BUFFER_CAPACITY = 2 * 1024 * 1024;
 constexpr size_t DVC_AUDIO_ES_BUFFER_CAPACITY = 8 * 1024 * 1024;
 constexpr uint32_t DVC_DMA_FALLBACK_MAX_BYTES = 0x2000;
 constexpr uint32_t DVC_DMA_AUDIO_SECTOR_BYTES = 2356;
+constexpr uint32_t DVC_AUDIO_OUTPUT_CHUNK_SAMPLES = 1152;
+constexpr uint32_t DVC_AUDIO_TIMER_GRANULARITY_SAMPLES = 64;
+constexpr uint32_t DVC_AUDIO_DAC_TARGET_SAMPLES = DVC_AUDIO_OUTPUT_CHUNK_SAMPLES * 8;
+constexpr uint32_t DVC_AUDIO_DAC_MIN_FILL_SAMPLES = DVC_AUDIO_OUTPUT_CHUNK_SAMPLES * 4;
+constexpr uint32_t DVC_AUDIO_START_PREBUFFER_SAMPLES = DVC_AUDIO_OUTPUT_CHUNK_SAMPLES * 8;
+constexpr uint32_t DVC_AUDIO_RESUME_PREBUFFER_SAMPLES = DVC_AUDIO_OUTPUT_CHUNK_SAMPLES * 4;
+constexpr size_t DVC_AUDIO_MAX_FRAMES_PER_DECODE = 4;
+constexpr size_t DVC_VIDEO_MAX_FRAMES_PER_DECODE = 2;
+constexpr size_t DVC_VIDEO_QUEUE_TARGET = 2;
 
 constexpr uint16_t DVC_FMA_ISR_EOI = 0x0001;
 constexpr uint16_t DVC_FMA_ISR_CSU = 0x0002;
@@ -127,6 +136,58 @@ uint16_t dvc_rate_code(double rate_hz)
 uint16_t dvc_reduced_timestamp(int64_t timestamp)
 {
 	return uint16_t((uint64_t(timestamp) >> 7) & 0x7fff);
+}
+
+int dvc_peek_l2_frame_bytes(const std::vector<uint8_t> &buffer, size_t bytes, int bitpos)
+{
+	static constexpr int bitrate_tab[16] = {
+		0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0
+	};
+	static constexpr int srate_tab[4] = { 44100, 48000, 32000, 0 };
+
+	if ((bitpos < 0) || (bitpos & 7))
+		return -1;
+
+	const size_t offset = size_t(bitpos >> 3);
+	if ((offset + 4) > bytes)
+		return -1;
+
+	const uint32_t header =
+		(uint32_t(buffer[offset + 0]) << 24) |
+		(uint32_t(buffer[offset + 1]) << 16) |
+		(uint32_t(buffer[offset + 2]) << 8) |
+		uint32_t(buffer[offset + 3]);
+
+	if ((header & 0xfff00000U) != 0xfff00000U)
+		return -1;
+
+	const int version_id = (header >> 19) & 0x3;
+	const int layer = (header >> 17) & 0x3;
+	const int bitrate_index = (header >> 12) & 0xf;
+	const int srate_index = (header >> 10) & 0x3;
+	const int padding = (header >> 9) & 0x1;
+
+	if ((version_id != 3) || (layer != 2) || (bitrate_index <= 0) || (bitrate_index >= 15) || (srate_index >= 3))
+		return -1;
+
+	return ((144000 * bitrate_tab[bitrate_index]) / srate_tab[srate_index]) + padding;
+}
+
+int dvc_count_complete_l2_frames(const std::vector<uint8_t> &buffer, size_t bytes, int bitpos, int max_frames)
+{
+	int frames = 0;
+	int scan_bitpos = bitpos;
+	while (frames < max_frames)
+	{
+		const int frame_bytes = dvc_peek_l2_frame_bytes(buffer, bytes, scan_bitpos);
+		if (frame_bytes <= 0)
+			break;
+		if ((scan_bitpos + frame_bytes * 8) > int(bytes * 8U))
+			break;
+		scan_bitpos += frame_bytes * 8;
+		frames++;
+	}
+	return frames;
 }
 
 uint32_t dvc_scan_dma_fallback_bytes(address_space &program, uint32_t memory_address, bool video, uint8_t stream_filter)
@@ -289,6 +350,74 @@ static INPUT_PORTS_START( cdi )
 	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_BUTTON2) PORT_CODE(MOUSECODE_BUTTON2) PORT_NAME("Button 2")
 	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_BUTTON3) PORT_CODE(MOUSECODE_BUTTON3) PORT_NAME("Button 3")
 	PORT_BIT(0xf8, IP_ACTIVE_HIGH, IPT_UNUSED)
+
+	PORT_START("DEBUGLAY")
+	PORT_CONFNAME(0x01, 0x01, "Debug Backdrop / EV")
+	PORT_CONFSETTING(0x01, DEF_STR(On))
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFNAME(0x02, 0x02, "Debug Plane A")
+	PORT_CONFSETTING(0x02, DEF_STR(On))
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFNAME(0x04, 0x04, "Debug Plane B")
+	PORT_CONFSETTING(0x04, DEF_STR(On))
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFNAME(0x08, 0x08, "Debug Cursor")
+	PORT_CONFSETTING(0x08, DEF_STR(On))
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFNAME(0x10, 0x00, "Debug EV Force On Top")
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFSETTING(0x10, DEF_STR(On))
+	PORT_CONFNAME(0x20, 0x00, "Debug Raw EV Only")
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFSETTING(0x20, DEF_STR(On))
+	PORT_CONFNAME(0x40, 0x00, "Debug Replace Plane A With EV")
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFSETTING(0x40, DEF_STR(On))
+	PORT_CONFNAME(0x80, 0x00, "Debug EV Ignore Alpha")
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFSETTING(0x80, DEF_STR(On))
+	PORT_CONFNAME(0x100, 0x000, "Debug Swap A/B Transparency")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x100, DEF_STR(On))
+	PORT_CONFNAME(0x200, 0x000, "Debug Replace Plane B With EV")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x200, DEF_STR(On))
+	PORT_CONFNAME(0x400, 0x000, "Debug A Weight-Black Yields")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x400, DEF_STR(On))
+	PORT_CONFNAME(0x800, 0x000, "Debug B Weight-Black Yields")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x800, DEF_STR(On))
+	PORT_CONFNAME(0x1000, 0x000, "Debug Force A Front")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x1000, DEF_STR(On))
+	PORT_CONFNAME(0x2000, 0x000, "Debug Force B Front")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x2000, DEF_STR(On))
+	PORT_CONFNAME(0x4000, 0x000, "Debug Log SHOW_NT")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x4000, DEF_STR(On))
+	PORT_CONFNAME(0x8000, 0x000, "Debug A Matte0 Yields")
+	PORT_CONFSETTING(0x000, DEF_STR(Off))
+	PORT_CONFSETTING(0x8000, DEF_STR(On))
+	PORT_CONFNAME(0x10000, 0x0000, "Debug A Matte1 Yields")
+	PORT_CONFSETTING(0x0000, DEF_STR(Off))
+	PORT_CONFSETTING(0x10000, DEF_STR(On))
+	PORT_CONFNAME(0x20000, 0x0000, "Debug B Matte0 Yields")
+	PORT_CONFSETTING(0x0000, DEF_STR(Off))
+	PORT_CONFSETTING(0x20000, DEF_STR(On))
+	PORT_CONFNAME(0x40000, 0x0000, "Debug B Matte1 Yields")
+	PORT_CONFSETTING(0x0000, DEF_STR(Off))
+	PORT_CONFSETTING(0x40000, DEF_STR(On))
+	PORT_CONFNAME(0x80000, 0x00000, "Debug Replace Dominant Plane")
+	PORT_CONFSETTING(0x00000, DEF_STR(Off))
+	PORT_CONFSETTING(0x80000, DEF_STR(On))
+	PORT_CONFNAME(0x100000, 0x000000, "Debug Replace Sparse Plane")
+	PORT_CONFSETTING(0x000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x100000, DEF_STR(On))
+	PORT_CONFNAME(0x200000, 0x000000, "Debug Log Plane Stats")
+	PORT_CONFSETTING(0x000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x200000, DEF_STR(On))
 INPUT_PORTS_END
 
 static INPUT_PORTS_START( cdimono2 )
@@ -384,7 +513,9 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_fma_pending_stream_change));
 	save_item(NAME(m_dvc_audio_output_active));
 	save_item(NAME(m_dvc_audio_output_started_once));
+	save_item(NAME(m_dvc_audio_last_decoded_valid));
 	save_item(NAME(m_dvc_audio_output_level));
+	save_item(NAME(m_dvc_audio_last_decoded));
 	save_item(NAME(m_dvc_audio_empty_ticks));
 	save_item(NAME(m_dvc_fmv_register_update_latch));
 	save_item(NAME(m_dvc_fmv_register_update_scroll));
@@ -394,12 +525,14 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_dma_preview_count));
 	save_item(NAME(m_dvc_video_present_accum));
 	save_item(NAME(m_dvc_audio_sample_rate));
+	save_item(NAME(m_dvc_audio_dac_queued_samples));
 	save_item(NAME(m_dvc_audio_dma_last_mac));
 	save_item(NAME(m_dvc_audio_dma_span_hint));
 	save_item(NAME(m_dvc_audio_es_bytes));
 	save_item(NAME(m_dvc_audio_es_bitpos));
 	save_item(NAME(m_dvc_audio_mpeg_header));
 	save_item(NAME(m_dvc_frame_rate_hz));
+	save_item(NAME(m_dvc_audio_dac_last_tick));
 	save_item(NAME(m_dvc_dclk_base));
 
 	machine().save().register_postload(save_prepost_delegate(FUNC(cdi_state::dvc_restore_state), this));
@@ -592,6 +725,15 @@ void cdi_state::dvc_restore_state()
 	dvc_update_video_timer();
 	dvc_update_audio_timer();
 	dvc_update_irq();
+	dvc_log_video_state("reset", true);
+}
+
+void cdi_state::dvc_apply_video_show_mode()
+{
+	const uint8_t mode = (m_dvc_video_visible && (m_dvc_video_show_mode == DVC_SHOW_NT))
+		? uint8_t(mcd212_device::EXTERNAL_VIDEO_BETWEEN_PLANES)
+		: uint8_t(mcd212_device::EXTERNAL_VIDEO_BACKDROP);
+	m_mcd212->set_external_video_mode(mode);
 }
 
 void cdi_state::dvc_update_irq_timer()
@@ -637,14 +779,76 @@ void cdi_state::dvc_update_audio_timer()
 		return;
 	}
 
-	constexpr uint32_t chunk_samples = 64;
-	const attotime period = attotime::from_ticks(chunk_samples, m_dvc_audio_sample_rate);
+	const attotime period = attotime::from_ticks(DVC_AUDIO_TIMER_GRANULARITY_SAMPLES, m_dvc_audio_sample_rate);
 	if (!m_dvc_audio_timer->enabled() || (m_dvc_audio_timer->period() != period))
 		m_dvc_audio_timer->adjust(period, 0, period);
 }
 
+void cdi_state::dvc_update_audio_dac_fill()
+{
+	if (!m_dvc_audio_sample_rate)
+	{
+		m_dvc_audio_dac_queued_samples = 0;
+		m_dvc_audio_dac_last_tick = 0;
+		return;
+	}
+
+	const u64 current_tick = machine().time().as_ticks(m_dvc_audio_sample_rate);
+	if (!m_dvc_audio_dac_last_tick)
+	{
+		m_dvc_audio_dac_last_tick = current_tick;
+		return;
+	}
+
+	if (current_tick > m_dvc_audio_dac_last_tick)
+	{
+		const u64 elapsed = current_tick - m_dvc_audio_dac_last_tick;
+		if (elapsed >= m_dvc_audio_dac_queued_samples)
+			m_dvc_audio_dac_queued_samples = 0;
+		else
+			m_dvc_audio_dac_queued_samples -= uint32_t(elapsed);
+		m_dvc_audio_dac_last_tick = current_tick;
+	}
+}
+
+void cdi_state::dvc_flush_audio_output(size_t max_samples)
+{
+	if (!m_dvc_audio_output_active || !m_dvc_audio_sample_rate)
+		return;
+
+	dvc_update_audio_dac_fill();
+
+	size_t available_samples = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
+	if (!available_samples)
+		return;
+
+	if (max_samples)
+		available_samples = std::min(available_samples, max_samples);
+	if (!available_samples)
+		return;
+
+	std::vector<int16_t> interleaved(available_samples * 2);
+	for (size_t index = 0; index < available_samples; index++)
+	{
+		interleaved[index * 2 + 0] = m_dvc_audio_pcm[0].front();
+		interleaved[index * 2 + 1] = m_dvc_audio_pcm[1].front();
+		m_dvc_audio_pcm[0].pop_front();
+		m_dvc_audio_pcm[1].pop_front();
+	}
+
+	m_dvc_audio_output_level[0] = interleaved[(available_samples - 1) * 2 + 0];
+	m_dvc_audio_output_level[1] = interleaved[(available_samples - 1) * 2 + 1];
+
+	dmadac_sound_device *dac_list[2] = { m_dmadac[0], m_dmadac[1] };
+	dmadac_transfer(dac_list, 2, 1, 2, available_samples, interleaved.data());
+	m_dvc_audio_dac_queued_samples += uint32_t(available_samples);
+}
+
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_timer_tick)
 {
+	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
+	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
+	m_mcd212->set_debug_video_mask(uint32_t(debug >> 4));
 	dvc_raise_fmv_irq(DVC_FMV_ISR_TIM);
 	if (m_dvc_fma_started)
 		dvc_raise_fma_irq(DVC_FMA_ISR_POLL);
@@ -657,6 +861,9 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_timer_tick)
 
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_video_tick)
 {
+	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
+	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
+	m_mcd212->set_debug_video_mask(uint16_t((debug >> 4) & 0x7ff));
 	if (!m_dvc_playback_active)
 		return;
 
@@ -671,17 +878,15 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_video_tick)
 
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 {
+	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
+	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
+	m_mcd212->set_debug_video_mask(uint16_t((debug >> 4) & 0x7ff));
 	const uint32_t current_dclk = uint32_t(machine().time().as_ticks(45000) - m_dvc_dclk_base);
 	m_dvc_fma_dclk = current_dclk;
-	constexpr size_t chunk_samples = 64;
-	// MiSTer drains PCM from a decoder-owned FIFO at a fixed 44.1 kHz rate.
-	// Our simplified path decodes into software queues in larger bursts. Start
-	// once we have a short runway, then allow much smaller resumes after a pause
-	// so Joy-style sparse decode bursts don't produce long silent holes.
-	constexpr size_t audio_start_prebuffer_samples = 2304;
-	constexpr size_t audio_resume_prebuffer_samples = 64;
+	constexpr size_t chunk_samples = DVC_AUDIO_OUTPUT_CHUNK_SAMPLES;
 	size_t available_samples = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
-	const size_t resume_threshold = m_dvc_audio_output_started_once ? audio_resume_prebuffer_samples : audio_start_prebuffer_samples;
+	const size_t resume_threshold = m_dvc_audio_output_started_once ? DVC_AUDIO_RESUME_PREBUFFER_SAMPLES : DVC_AUDIO_START_PREBUFFER_SAMPLES;
+	bool started_output = false;
 
 	// MiSTer enables the FMA DSP when the stream start time is reached; the
 	// audio output FIFO fill level is a separate local concern.
@@ -707,6 +912,7 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 			m_dvc_audio_output_active = true;
 			m_dvc_audio_output_started_once = true;
 			m_dvc_audio_empty_ticks = 0;
+			started_output = true;
 			LOGMASKED(LOG_DVC, "%s: DVC audio output start queued=%u\n",
 				machine().describe_context(),
 				unsigned(available_samples));
@@ -715,6 +921,8 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 
 	if (!m_dvc_audio_sample_rate)
 		return;
+
+	dvc_update_audio_dac_fill();
 
 	// MiSTer's audio decoder runs continuously behind a FIFO; our software model
 	// only gets new PCM when we explicitly ask pl_mpeg for more. If the local
@@ -726,11 +934,15 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 		const size_t buffered_bytes = (m_dvc_audio_es_bitpos >= 0 && m_dvc_audio_es_bytes >= size_t(m_dvc_audio_es_bitpos >> 3))
 			? (m_dvc_audio_es_bytes - size_t(m_dvc_audio_es_bitpos >> 3))
 			: 0;
-		if ((queued_before < std::max(resume_threshold, chunk_samples * 8))
-			&& (buffered_bytes >= 4))
+		const int complete_frames = dvc_count_complete_l2_frames(m_dvc_audio_es, m_dvc_audio_es_bytes, m_dvc_audio_es_bitpos, 4);
+		const size_t desired_pcm = std::max<size_t>(resume_threshold, DVC_AUDIO_DAC_TARGET_SAMPLES);
+		if ((queued_before < desired_pcm)
+			&& (buffered_bytes >= 4)
+			&& (complete_frames >= (m_dvc_audio_output_active ? 1 : 2)))
 		{
 			dvc_decode_audio();
 			available_samples = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
+			dvc_update_audio_dac_fill();
 		}
 	}
 
@@ -741,37 +953,10 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 
 		if (m_dvc_audio_empty_ticks != 0xffff)
 			m_dvc_audio_empty_ticks++;
-
-		// MiSTer effectively holds the last sample while playback is starved and
-		// only nudges the DC bias toward zero slowly. Decaying to silence across
-		// every sample in one 64-sample block is much too aggressive and turns
-		// short Joy packet gaps into audible silent holes.
-		std::vector<int16_t> decay(chunk_samples * 2);
-		int16_t left = m_dvc_audio_output_level[0];
-		int16_t right = m_dvc_audio_output_level[1];
-		for (size_t index = 0; index < chunk_samples; index++)
-		{
-			decay[index * 2 + 0] = left;
-			decay[index * 2 + 1] = right;
-		}
-
-		if (left > 0)
-			left--;
-		else if (left < 0)
-			left++;
-		if (right > 0)
-			right--;
-		else if (right < 0)
-			right++;
-
-		m_dvc_audio_output_level[0] = left;
-		m_dvc_audio_output_level[1] = right;
-
-		dmadac_sound_device *dac_list[2] = { m_dmadac[0], m_dmadac[1] };
-		dmadac_transfer(dac_list, 2, 1, 2, chunk_samples, decay.data());
-		// Keep local output running through sparse Joy-style bursts. Hardware-visible
-		// stop/reset still comes from the FMA command path, not from our software PCM
-		// queue briefly running dry between valid packets.
+		// Let the DAC's own FIFO drain naturally instead of synthesizing held
+		// samples into the stream. The native decoder path already fixed the
+		// compressed-data side; remaining clicks are more likely to come from
+		// these artificial software filler blocks than from true starvation.
 		return;
 	}
 
@@ -779,38 +964,14 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 	if (!m_dvc_audio_output_active)
 		return;
 
-	const size_t count = std::min(available_samples, chunk_samples);
-	if (!count)
-		return;
-
-	std::vector<int16_t> interleaved(chunk_samples * 2);
-	for (size_t index = 0; index < count; index++)
+	const size_t target_fill = started_output ? DVC_AUDIO_DAC_TARGET_SAMPLES : DVC_AUDIO_DAC_MIN_FILL_SAMPLES;
+	if (m_dvc_audio_dac_queued_samples < target_fill)
 	{
-		interleaved[index * 2 + 0] = m_dvc_audio_pcm[0].front();
-		interleaved[index * 2 + 1] = m_dvc_audio_pcm[1].front();
-		m_dvc_audio_pcm[0].pop_front();
-		m_dvc_audio_pcm[1].pop_front();
+		const size_t missing = target_fill - m_dvc_audio_dac_queued_samples;
+		const size_t flush_samples = std::min(available_samples, std::max(chunk_samples, missing));
+		if (flush_samples)
+			dvc_flush_audio_output(flush_samples);
 	}
-
-	m_dvc_audio_output_level[0] = interleaved[(count - 1) * 2 + 0];
-	m_dvc_audio_output_level[1] = interleaved[(count - 1) * 2 + 1];
-
-	for (size_t index = count; index < chunk_samples; index++)
-	{
-		interleaved[index * 2 + 0] = m_dvc_audio_output_level[0];
-		interleaved[index * 2 + 1] = m_dvc_audio_output_level[1];
-	}
-
-	if (count < chunk_samples)
-	{
-		LOGMASKED(LOG_DVC, "%s: DVC audio short block count=%u padded=%u\n",
-			machine().describe_context(),
-			unsigned(count),
-			unsigned(chunk_samples - count));
-	}
-
-	dmadac_sound_device *dac_list[2] = { m_dmadac[0], m_dmadac[1] };
-	dmadac_transfer(dac_list, 2, 1, 2, chunk_samples, interleaved.data());
 }
 
 uint8_t cdi_state::dvc_iack_r()
@@ -888,6 +1049,7 @@ void cdi_state::dvc_reset()
 	m_dvc_fma_pending_stream_change = false;
 	m_dvc_audio_output_active = false;
 	m_dvc_audio_output_started_once = false;
+	m_dvc_audio_last_decoded_valid = false;
 	m_dvc_fmv_register_update_latch = false;
 	m_dvc_fmv_register_update_scroll = false;
 	m_dvc_mpeg_ram_enabled = false;
@@ -895,11 +1057,15 @@ void cdi_state::dvc_reset()
 	m_dvc_dma_preview_count = 0;
 	m_dvc_video_present_accum = 0;
 	m_dvc_audio_sample_rate = 0;
+	m_dvc_audio_dac_queued_samples = 0;
 	m_dvc_audio_dma_last_mac = 0;
 	m_dvc_audio_dma_span_hint = 0;
 	m_dvc_audio_output_level[0] = 0;
 	m_dvc_audio_output_level[1] = 0;
+	m_dvc_audio_last_decoded[0] = 0;
+	m_dvc_audio_last_decoded[1] = 0;
 	m_dvc_audio_empty_ticks = 0;
+	m_dvc_audio_dac_last_tick = 0;
 	m_dvc_frame_rate_hz = 25.0;
 	m_dvc_fmv_demux_timestamp = 0;
 	m_dvc_fmv_last_decoded_timestamp = 0;
@@ -957,13 +1123,18 @@ void cdi_state::dvc_reset_audio_decoder()
 	m_dvc_audio_pcm[0].clear();
 	m_dvc_audio_pcm[1].clear();
 	m_dvc_audio_sample_rate = 0;
+	m_dvc_audio_dac_queued_samples = 0;
 	m_dvc_audio_dma_last_mac = 0;
 	m_dvc_audio_dma_span_hint = 0;
 	m_dvc_audio_output_active = false;
 	m_dvc_audio_output_started_once = false;
+	m_dvc_audio_last_decoded_valid = false;
 	m_dvc_audio_output_level[0] = 0;
 	m_dvc_audio_output_level[1] = 0;
+	m_dvc_audio_last_decoded[0] = 0;
+	m_dvc_audio_last_decoded[1] = 0;
 	m_dvc_audio_empty_ticks = 0;
+	m_dvc_audio_dac_last_tick = 0;
 	m_dmadac[0]->enable(0);
 	m_dmadac[1]->enable(0);
 	dvc_update_audio_timer();
@@ -971,6 +1142,48 @@ void cdi_state::dvc_reset_audio_decoder()
 	// native decoder byte-aligned between frames avoids false sync at random
 	// bit offsets inside the payload.
 	m_dvc_audio_decoder = std::make_unique<mpeg_audio>(m_dvc_audio_es.data(), mpeg_audio::L2, false, 8);
+}
+
+void cdi_state::dvc_log_video_state(const char *reason, bool force)
+{
+	const uint32_t signature =
+		(m_dvc_video_visible ? 0x00000001 : 0x00000000) |
+		(m_dvc_video_show_pending ? 0x00000002 : 0x00000000) |
+		(m_dvc_playback_active ? 0x00000004 : 0x00000000) |
+		(m_dvc_decoder_enabled ? 0x00000008 : 0x00000000) |
+		(uint32_t(m_dvc_video_show_mode & 0x03) << 4) |
+		(uint32_t(std::min<size_t>(m_dvc_video_queue.size(), 0xff)) << 8) |
+		(uint32_t(m_dvc_fmv_system_command) << 16);
+
+	if (!force
+		&& (signature == m_dvc_last_video_log_signature)
+		&& (m_dvc_display_frame.width == m_dvc_last_video_log_frame_w)
+		&& (m_dvc_display_frame.height == m_dvc_last_video_log_frame_h))
+	{
+		return;
+	}
+
+	m_dvc_last_video_log_signature = signature;
+	m_dvc_last_video_log_frame_w = m_dvc_display_frame.width;
+	m_dvc_last_video_log_frame_h = m_dvc_display_frame.height;
+
+	LOGMASKED(LOG_DVC, "%s: DVC video state [%s] vis=%d show_pending=%d mode=%u play=%d dec=%d queue=%u frame=%ux%u sys=%04x vid=%04x ev_pending=%d ev_active=%d ev_dirty=%d icm_ev=%d\n",
+		machine().describe_context(),
+		reason,
+		m_dvc_video_visible ? 1 : 0,
+		m_dvc_video_show_pending ? 1 : 0,
+		unsigned(m_dvc_video_show_mode),
+		m_dvc_playback_active ? 1 : 0,
+		m_dvc_decoder_enabled ? 1 : 0,
+		unsigned(m_dvc_video_queue.size()),
+		m_dvc_display_frame.width,
+		m_dvc_display_frame.height,
+		m_dvc_fmv_system_command,
+		m_dvc_fmv_video_command,
+		m_mcd212->external_video_pending_enabled() ? 1 : 0,
+		m_mcd212->external_video_active_enabled() ? 1 : 0,
+		m_mcd212->external_video_dirty() ? 1 : 0,
+		m_mcd212->external_video_icm_enabled() ? 1 : 0);
 }
 
 void cdi_state::dvc_update_irq()
@@ -1018,6 +1231,7 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 		m_dvc_playback_active = false;
 		m_dvc_video_visible = false;
 		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
 		dvc_reset_video_decoder();
 		dvc_rebuild_external_video();
 	}
@@ -1025,6 +1239,9 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	if (data & 0x0100)
 	{
 		m_dvc_playback_active = false;
+		m_dvc_video_visible = false;
+		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
 		dvc_reset_video_decoder();
 		dvc_rebuild_external_video();
 	}
@@ -1044,7 +1261,13 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	}
 
 	if (data & 0x0010)
+	{
 		m_dvc_playback_active = false;
+		m_dvc_video_visible = false;
+		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
+		dvc_rebuild_external_video();
+	}
 
 	if (data & 0x0020)
 	{
@@ -1060,9 +1283,16 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	}
 
 	if (data & 0x0080)
+	{
 		m_dvc_playback_active = false;
+		m_dvc_video_visible = false;
+		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
+		dvc_rebuild_external_video();
+	}
 
 	dvc_update_video_timer();
+	dvc_log_video_state("fmv system cmd", true);
 }
 
 void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
@@ -1070,35 +1300,48 @@ void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
 	LOGMASKED(LOG_DVC, "%s: DVC FMV video command %04x\n", machine().describe_context(), data);
 	m_dvc_fmv_video_command = data;
 
-	if (data & 0x0100)
+	const bool show_t = (data & 0x0020) && !(data & 0x0200) && !(data & 0x0400);
+	const bool show_nt = (data & 0x0200) != 0;
+	const bool show_pending_nt = (data & 0x0400) != 0;
+	const bool hide_only = (data & 0x0100) && !show_t && !show_nt && !show_pending_nt;
+
+	if (hide_only)
 	{
 		m_dvc_video_visible = false;
 		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
 		dvc_rebuild_external_video();
 	}
 
-	if (data & 0x0020)
+	if (show_t)
 	{
 		m_dvc_video_visible = true;
 		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_T;
 		dvc_rebuild_external_video();
 	}
 
-	if (data & 0x0200)
+	if (show_nt)
 	{
 		m_dvc_video_visible = true;
 		m_dvc_video_show_pending = false;
+		m_dvc_video_show_mode = DVC_SHOW_NT;
 		dvc_rebuild_external_video();
 	}
 
-	if (data & 0x0400)
+	if (show_pending_nt)
+	{
 		m_dvc_video_show_pending = true;
+		m_dvc_video_show_mode = DVC_SHOW_NT;
+	}
 
 	if (data & 0x0008)
 	{
 		m_dvc_fmv_register_update_latch = true;
 		m_dvc_fmv_register_update_scroll = BIT(data, 2);
 	}
+
+	dvc_log_video_state("fmv video cmd", true);
 }
 
 void cdi_state::dvc_handle_fma_command(uint16_t data)
@@ -1131,21 +1374,30 @@ void cdi_state::dvc_handle_dma_transfer(bool video)
 {
 	auto &dma = m_maincpu->dma().channel[1];
 	address_space &program = m_maincpu->space(AS_PROGRAM);
-	uint32_t transfer_words = dma.transfer_counter ? (uint32_t(dma.transfer_counter) + 1) : 1;
-	LOGMASKED(LOG_DVC, "%s: DVC DMA %s mac=%06x dac=%06x count=%04x words=%u seq=%02x\n",
-		machine().describe_context(),
-		video ? "video" : "audio",
-		dma.memory_address_counter & 0x00fffffe,
-		dma.device_address_counter,
-		dma.transfer_counter,
-		transfer_words,
-		dma.sequence_control);
-
 	uint32_t memory_address = dma.memory_address_counter & 0x00fffffe;
 	uint32_t device_address = dma.device_address_counter;
 	const bool increment_memory = (dma.sequence_control & SCC_DMA_SEQ_MAC_INC) != 0;
 	const bool increment_device = (dma.sequence_control & SCC_DMA_SEQ_DAC_INC) != 0;
 	const uint8_t stream_filter = video ? (m_dvc_fmv_stream & 0x0f) : (m_dvc_fma_stream & 0x0f);
+	uint32_t transfer_words = dma.transfer_counter ? (uint32_t(dma.transfer_counter) + 1) : 1;
+
+	// VMPEG audio bursts consistently program exact compressed payload sizes in
+	// the DMA transfer counter (for example 0x0480 -> 2304 bytes). Consuming
+	// "count + 1" words on every nonzero FMA transfer pulls two stray bytes from
+	// the next ring slot into the MPEG audio elementary stream and causes tiny
+	// recurring clicks. Keep the zero-count final-word fallback for the SCC68070
+	// quirk, but treat nonzero FMA counts as exact payload words.
+	if (!video && dma.transfer_counter && increment_memory && !increment_device)
+		transfer_words = uint32_t(dma.transfer_counter);
+
+	LOGMASKED(LOG_DVC, "%s: DVC DMA %s mac=%06x dac=%06x count=%04x words=%u seq=%02x\n",
+		machine().describe_context(),
+		video ? "video" : "audio",
+		memory_address,
+		device_address,
+		dma.transfer_counter,
+		transfer_words,
+		dma.sequence_control);
 
 	if (!video && increment_memory && !increment_device)
 	{
@@ -1564,7 +1816,8 @@ void cdi_state::dvc_decode_video()
 		m_dvc_image_rt = dvc_rate_code(rate_hz);
 	}
 
-	while (m_dvc_video_queue.size() < 8)
+	size_t decoded_frames = 0;
+	while (m_dvc_video_queue.size() < DVC_VIDEO_QUEUE_TARGET && decoded_frames < DVC_VIDEO_MAX_FRAMES_PER_DECODE)
 	{
 		plm_frame_t *const frame = plm_video_decode(m_dvc_video_plm);
 		if (!frame)
@@ -1591,6 +1844,7 @@ void cdi_state::dvc_decode_video()
 		m_dvc_fmv_video_data_input_command |= 0x4000;
 		m_dvc_video_queue.push_back(std::move(queued));
 		decoded_any = true;
+		decoded_frames++;
 	}
 
 	if (decoded_any)
@@ -1629,10 +1883,16 @@ void cdi_state::dvc_decode_audio()
 
 	bool decoded_any = false;
 	size_t decoded_samples = 0;
+	size_t decoded_frames = 0;
 	std::array<short, 1152 * 2> decoded{};
 	for (;;)
 	{
+		if (decoded_frames >= DVC_AUDIO_MAX_FRAMES_PER_DECODE)
+			break;
 		const int start_bitpos = m_dvc_audio_es_bitpos;
+		const int frame_bytes = dvc_peek_l2_frame_bytes(m_dvc_audio_es, m_dvc_audio_es_bytes, start_bitpos);
+		if ((frame_bytes > 0) && ((start_bitpos + frame_bytes * 8) > limit_bits))
+			break;
 		int next_bitpos = m_dvc_audio_es_bitpos;
 		int output_samples = 0;
 		int sample_rate = 0;
@@ -1674,6 +1934,8 @@ void cdi_state::dvc_decode_audio()
 		if ((sample_rate > 0) && (m_dvc_audio_sample_rate != uint32_t(sample_rate)))
 		{
 			m_dvc_audio_sample_rate = uint32_t(sample_rate);
+			m_dvc_audio_dac_queued_samples = 0;
+			m_dvc_audio_dac_last_tick = machine().time().as_ticks(m_dvc_audio_sample_rate);
 			LOGMASKED(LOG_DVC, "%s: DVC audio sample rate %u Hz\n",
 				machine().describe_context(),
 				unsigned(m_dvc_audio_sample_rate));
@@ -1710,10 +1972,13 @@ void cdi_state::dvc_decode_audio()
 
 		for (int index = 0; index < output_samples; index++)
 		{
-			const int16_t left = decoded[index * channels + 0];
-			const int16_t right = (channels > 1) ? decoded[index * channels + 1] : left;
-			m_dvc_audio_pcm[0].push_back(left);
-			m_dvc_audio_pcm[1].push_back(right);
+			const int16_t raw_left = decoded[index * channels + 0];
+			const int16_t raw_right = (channels > 1) ? decoded[index * channels + 1] : raw_left;
+			m_dvc_audio_pcm[0].push_back(raw_left);
+			m_dvc_audio_pcm[1].push_back(raw_right);
+			m_dvc_audio_last_decoded[0] = raw_left;
+			m_dvc_audio_last_decoded[1] = raw_right;
+			m_dvc_audio_last_decoded_valid = true;
 		}
 
 		m_dvc_audio_es_bitpos = next_bitpos;
@@ -1731,6 +1996,7 @@ void cdi_state::dvc_decode_audio()
 
 		decoded_samples += size_t(output_samples);
 		decoded_any = true;
+		decoded_frames++;
 	}
 
 	if (decoded_any)
@@ -1752,6 +2018,19 @@ void cdi_state::dvc_decode_audio()
 			m_dvc_fma_pending_stream_change = false;
 			dvc_raise_fma_irq(DVC_FMA_ISR_CSU);
 		}
+
+		if (m_dvc_audio_output_active)
+		{
+			dvc_update_audio_dac_fill();
+			if (m_dvc_audio_dac_queued_samples < DVC_AUDIO_DAC_MIN_FILL_SAMPLES)
+			{
+				const size_t available = std::min(m_dvc_audio_pcm[0].size(), m_dvc_audio_pcm[1].size());
+				const size_t missing = DVC_AUDIO_DAC_TARGET_SAMPLES - std::min<uint32_t>(m_dvc_audio_dac_queued_samples, DVC_AUDIO_DAC_TARGET_SAMPLES);
+				if (available)
+					dvc_flush_audio_output(std::min(available, std::max<size_t>(DVC_AUDIO_OUTPUT_CHUNK_SAMPLES, missing)));
+			}
+		}
+
 	}
 }
 
@@ -1800,6 +2079,7 @@ void cdi_state::dvc_present_next_frame()
 	{
 		m_dvc_video_show_pending = false;
 		m_dvc_video_visible = true;
+		m_dvc_video_show_mode = DVC_SHOW_NT;
 	}
 	if (m_dvc_fmv_register_update_latch && !m_dvc_fmv_register_update_scroll)
 	{
@@ -1807,6 +2087,7 @@ void cdi_state::dvc_present_next_frame()
 		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP | DVC_FMV_ISR_DCL);
 	}
 
+	dvc_log_video_state("present frame", true);
 	dvc_rebuild_external_video();
 	dvc_raise_fmv_irq(DVC_FMV_ISR_PIC);
 	if (last_program_frame)
@@ -1818,6 +2099,9 @@ void cdi_state::dvc_present_next_frame()
 
 void cdi_state::dvc_rebuild_external_video()
 {
+	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
+	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
+	m_mcd212->set_debug_video_mask(uint16_t((debug >> 4) & 0x7ff));
 	m_mcd212->clear_external_video();
 	LOGMASKED(LOG_DVC, "%s: DVC rebuild ext video visible=%d pixels=%u active=%dx%d window=%dx%d display=%dx%d offset=%dx%d crop=%dx%d\n",
 		machine().describe_context(),
@@ -1833,9 +2117,14 @@ void cdi_state::dvc_rebuild_external_video()
 		m_dvc_fmv_y_offset,
 		m_dvc_fmv_decoder_offset_x,
 		m_dvc_fmv_decoder_offset_y);
+	dvc_log_video_state("rebuild ext video");
 
 	if (!m_dvc_video_visible || m_dvc_display_frame.pixels.empty())
 	{
+		LOGMASKED(LOG_DVC, "%s: DVC ext video skip reason=%s\n",
+			machine().describe_context(),
+			!m_dvc_video_visible ? "hidden" : "no display frame");
+		dvc_apply_video_show_mode();
 		m_mcd212->set_external_video_enable(false);
 		return;
 	}
@@ -1854,14 +2143,48 @@ void cdi_state::dvc_rebuild_external_video()
 	// displayed picture area; the "active" registers don't appear to size the
 	// final overlay. Horizontal units are half-resolution relative to the
 	// MCD212's 768-pixel-wide backdrop plane, so expand width and X position.
-	const int draw_w = std::max(0, source_w * 2);
-	const int draw_h = std::max(0, source_h);
+	int draw_w = std::max(0, source_w * 2);
+	int draw_h = std::max(0, source_h);
 	// Titles like Repeat Offender leave Xd/Yd at zero and rely on Xo/Yo for
 	// placement, while others program explicit display positions.
 	// Both Xd and Xo are programmed in half-resolution horizontal units, so
 	// either source must be expanded to the 768-pixel MCD212 backdrop space.
-	const int dest_x = m_dvc_fmv_x_display ? (int(m_dvc_fmv_x_display) * 2) : (int(m_dvc_fmv_x_offset) * 2);
-	const int dest_y = m_dvc_fmv_y_display ? int(m_dvc_fmv_y_display) : int(m_dvc_fmv_y_offset);
+	int dest_x = m_dvc_fmv_x_display ? (int(m_dvc_fmv_x_display) * 2) : (int(m_dvc_fmv_x_offset) * 2);
+	int dest_y = m_dvc_fmv_y_display ? int(m_dvc_fmv_y_display) : int(m_dvc_fmv_y_offset);
+
+	// Some titles program a full active FMV area but still leave Xd at zero and
+	// an Xo/Yo pair that would place the scaled window partly off-screen if
+	// interpreted literally. When that happens, treat the active dimensions as
+	// the intended display size and clamp the picture back onto the external
+	// video plane instead of cropping off the right/bottom edges.
+	if (!m_dvc_fmv_x_display && !m_dvc_fmv_y_display)
+	{
+		const int active_draw_w = std::max(0, int(m_dvc_fmv_x_active) * 2);
+		const int active_draw_h = std::max(0, int(m_dvc_fmv_y_active));
+		if ((dest_x + draw_w) > bitmap.width() && active_draw_w > 0 && active_draw_w <= bitmap.width())
+		{
+			draw_w = active_draw_w;
+			dest_x = 0;
+		}
+		if (active_draw_h > 0 && active_draw_h <= bitmap.height())
+		{
+			const bool using_full_width = (draw_w == bitmap.width());
+			const bool y_offscreen = (dest_y + draw_h) > bitmap.height();
+			const bool active_is_full_height = (active_draw_h >= 240);
+			if ((y_offscreen || (using_full_width && active_is_full_height)) && active_draw_h >= draw_h)
+			{
+				draw_h = active_draw_h;
+				dest_y = 0;
+			}
+		}
+	}
+
+	if (draw_w > bitmap.width())
+		draw_w = bitmap.width();
+	if (draw_h > bitmap.height())
+		draw_h = bitmap.height();
+	dest_x = std::clamp(dest_x, 0, std::max(0, bitmap.width() - draw_w));
+	dest_y = std::clamp(dest_y, 0, std::max(0, bitmap.height() - draw_h));
 	LOGMASKED(LOG_DVC, "%s: DVC ext video map src=%dx%d+%d+%d draw=%dx%d dest=%d,%d\n",
 		machine().describe_context(),
 		source_w,
@@ -1876,6 +2199,17 @@ void cdi_state::dvc_rebuild_external_video()
 	if (source_w <= 0 || source_h <= 0 || draw_w <= 0 || draw_h <= 0
 		|| dest_x >= bitmap.width() || dest_y >= bitmap.height())
 	{
+		LOGMASKED(LOG_DVC, "%s: DVC ext video skip reason=invalid map src=%dx%d draw=%dx%d dest=%d,%d bitmap=%dx%d\n",
+			machine().describe_context(),
+			source_w,
+			source_h,
+			draw_w,
+			draw_h,
+			dest_x,
+			dest_y,
+			bitmap.width(),
+			bitmap.height());
+		dvc_apply_video_show_mode();
 		m_mcd212->set_external_video_enable(false);
 		return;
 	}
@@ -1888,11 +2222,13 @@ void cdi_state::dvc_rebuild_external_video()
 		for (int x = 0; x < draw_w && (dest_x + x) < bitmap.width(); x++)
 		{
 			const int sample_x = src_x + ((x * source_w) / draw_w);
-			dst[x] = src[sample_x];
+			dst[x] = 0xff000000 | (src[sample_x] & 0x00ffffff);
 		}
 	}
 
+	dvc_apply_video_show_mode();
 	m_mcd212->set_external_video_enable(true);
+	dvc_log_video_state("rebuild ext video done", true);
 }
 
 uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)

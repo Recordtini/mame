@@ -63,7 +63,16 @@ public:
 		DEBUG_VIDEO_YIELD_B_MF1  = 0x4000,
 		DEBUG_VIDEO_REPLACE_DOMINANT = 0x8000,
 		DEBUG_VIDEO_REPLACE_SPARSE   = 0x10000,
-		DEBUG_VIDEO_LOG_PLANE_STATS  = 0x20000
+		DEBUG_VIDEO_LOG_PLANE_STATS  = 0x20000,
+		DEBUG_VIDEO_SHOWNT_BACKDROP_ONLY = 0x40000,
+		DEBUG_VIDEO_SHOWNT_ALLOW_FRONT_REPLACE = 0x80000,
+		DEBUG_VIDEO_SHOWNT_DISABLE_DYUV_REPLACE = 0x100000,
+		DEBUG_VIDEO_MISTER_WEIGHT_MATH = 0x200000,
+		DEBUG_VIDEO_SHOWNT_MATTE_REPLACE = 0x400000,
+		DEBUG_VIDEO_REGION_NEXT_PIXEL = 0x800000,
+		DEBUG_VIDEO_DISABLE_A_COLOR_KEY = 0x1000000,
+		DEBUG_VIDEO_DISABLE_B_COLOR_KEY = 0x2000000,
+		DEBUG_VIDEO_GREENBOOK_TCR_OR = 0x4000000
 	};
 
 	enum external_video_mode : uint8_t
@@ -89,13 +98,16 @@ public:
 	bitmap_rgb32 &external_video() { return m_external_video_pending; }
 	void clear_external_video();
 	void set_external_video_enable(bool enable);
+	void set_external_video_select(bool select);
 	void set_external_video_mode(uint8_t mode);
+	void set_external_video_page(uint8_t page);
+	void reset_external_video_overlay_baseline();
 	void set_debug_layer_mask(uint8_t mask);
 	void set_debug_video_mask(uint32_t mask);
 	bool external_video_pending_enabled() const { return m_external_video_pending_enabled; }
 	bool external_video_active_enabled() const { return m_external_video_active_enabled; }
 	bool external_video_dirty() const { return m_external_video_dirty; }
-	bool external_video_icm_enabled() const { return BIT(m_image_coding_method, ICM_EV_BIT); }
+	bool external_video_icm_enabled() const { return BIT(m_image_coding_method, ICM_EV_BIT) || m_external_video_select_active; }
 
 	void map(address_map &map) ATTR_COLD;
 
@@ -238,6 +250,7 @@ protected:
 	uint16_t m_dcp[2]{};
 	uint32_t m_dca[2]{};
 	uint32_t m_clut[256]{};
+	uint32_t m_image_coding_method_programmed = 0;
 	uint32_t m_image_coding_method = 0;
 	uint32_t m_transparency_control = 0;
 	uint32_t m_plane_order = 0;
@@ -249,16 +262,32 @@ protected:
 	uint32_t m_cursor_control = 0;
 	uint32_t m_cursor_pattern[16]{};
 	uint32_t m_matte_control[8]{};
+	int32_t m_matte_control_scanline[8]{};
+	uint8_t m_matte_control_path[8]{};
 	uint32_t m_backdrop_color = 0;
 	uint32_t m_mosaic_hold[2]{};
 	uint8_t m_base_weight_factor[2]{};
+	uint8_t m_current_weight_factor[2]{};
 	uint8_t m_weight_factor[2][768]{};
+	bool m_dyuv_pixel[2][768]{};
+	uint32_t m_video_line_source[2]{};
 	bitmap_rgb32 m_external_video_pending;
 	bitmap_rgb32 m_external_video_active;
+	uint32_t m_external_video_overlay_baseline[2][312][768]{};
+	bool m_external_video_overlay_baseline_dyuv[2][312][768]{};
+	uint32_t m_external_video_overlay_source[2][312]{};
+	uint8_t m_external_video_overlay_dense_history[2][312]{};
+	uint8_t m_external_video_overlay_dense_current[2][312]{};
 	bool m_external_video_pending_enabled = false;
 	bool m_external_video_active_enabled = false;
+	bool m_external_video_select_pending = false;
+	bool m_external_video_select_active = false;
 	bool m_external_video_dirty = false;
+	bool m_external_video_overlay_capture = false;
+	bool m_external_video_overlay_baseline_valid = false;
+	uint8_t m_external_video_overlay_blockers = 0;
 	uint8_t m_external_video_mode = EXTERNAL_VIDEO_BACKDROP;
+	uint8_t m_external_video_page = 0;
 	uint8_t m_debug_layer_mask = DEBUG_LAYER_ALL;
 	uint32_t m_debug_video_mask = 0;
 	uint32_t m_ev_backdrop_hits = 0;
@@ -273,6 +302,10 @@ protected:
 	uint32_t m_ev_src_b_hits = 0;
 	uint32_t m_last_ev_log_signature = 0xffffffff;
 	uint32_t m_last_ev_log_nonblack = 0xffffffff;
+	uint64_t m_last_ev_summary_signature = ~uint64_t(0);
+	uint64_t m_last_ev_line_signature = ~uint64_t(0);
+	uint32_t m_last_dca_control_signature[2][312]{};
+	uint64_t m_last_ica_head_signature[2]{};
 	uint32_t m_pending_vsr[2]{};
 	bool m_pending_vsr_valid[2]{};
 
@@ -310,6 +343,7 @@ protected:
 	int m_ica_height = 0;
 	int m_total_height = 0;
 	int m_last_rendered_scanline = -1;
+	int m_current_render_scanline = -1;
 	emu_timer *m_ica_timer = nullptr;
 	emu_timer *m_dca_timer = nullptr;
 
@@ -326,6 +360,10 @@ protected:
 	int get_screen_width();
 	int get_border_width();
 	int get_dca_trigger_x();
+	bool active_lines_are_doubled() const;
+	int physical_to_logical_scanline(int physical_scanline) const;
+	int logical_to_physical_scanline(int logical_scanline) const;
+	int dca_trigger_scanline(int logical_scanline) const;
 	void log_external_video_state(const char *reason, bool force = false);
 	uint32_t get_backdrop_plane(int x, int y);
 
@@ -334,6 +372,8 @@ protected:
 
 	template <int Path> void set_dcp(uint32_t value);
 	template <int Path> uint32_t get_dcp();
+	uint16_t read_dram_word(uint32_t address) const;
+	uint8_t read_dram_byte(uint32_t address) const;
 
 	template <int Path> void set_display_parameters(uint8_t value);
 

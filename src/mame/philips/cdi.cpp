@@ -95,6 +95,7 @@ constexpr uint16_t DVC_FMA_ISR_UNF = 0x0008;
 constexpr uint16_t DVC_FMA_ISR_DEC = 0x0010;
 constexpr uint16_t DVC_FMA_ISR_POLL = 0x0100;
 
+constexpr uint16_t DVC_FMV_ISR_SEQ = 0x0001;
 constexpr uint16_t DVC_FMV_ISR_PIC = 0x0004;
 constexpr uint16_t DVC_FMV_ISR_EOD = 0x0008;
 constexpr uint16_t DVC_FMV_ISR_NDAT = 0x0020;
@@ -136,6 +137,21 @@ uint16_t dvc_rate_code(double rate_hz)
 uint16_t dvc_reduced_timestamp(int64_t timestamp)
 {
 	return uint16_t((uint64_t(timestamp) >> 7) & 0x7fff);
+}
+
+int64_t dvc_mpeg_clock_delta(uint64_t target, uint64_t reference)
+{
+	// MPEG-1 system clock references and presentation timestamps are 33-bit
+	// counters.  Subtracting them as ordinary 64-bit values makes a timestamp
+	// just after wrap look almost 26.5 hours older than an SCR just before wrap.
+	constexpr uint64_t clock_modulus = uint64_t(1) << 33;
+	constexpr uint64_t clock_mask = clock_modulus - 1;
+	constexpr int64_t clock_half_range = int64_t(1) << 32;
+
+	int64_t delta = int64_t((target - reference) & clock_mask);
+	if (delta >= clock_half_range)
+		delta -= int64_t(clock_modulus);
+	return delta;
 }
 
 int dvc_peek_l2_frame_bytes(const std::vector<uint8_t> &buffer, size_t bytes, int bitpos)
@@ -277,6 +293,7 @@ void dvc_set_bits(uint64_t &value, unsigned start, unsigned width, uint64_t bits
 #define LOG_QUIZARD_WRITES  (1U << 3)
 #define LOG_QUIZARD_OTHER   (1U << 4)
 #define LOG_UART            (1U << 5)
+#define LOG_DVC_IO          (1U << 6)
 
 #define VERBOSE         (LOG_DVC)
 #include "logmacro.h"
@@ -418,6 +435,33 @@ static INPUT_PORTS_START( cdi )
 	PORT_CONFNAME(0x200000, 0x000000, "Debug Log Plane Stats")
 	PORT_CONFSETTING(0x000000, DEF_STR(Off))
 	PORT_CONFSETTING(0x200000, DEF_STR(On))
+	PORT_CONFNAME(0x400000, 0x000000, "Debug SHOW_NT Backdrop Only")
+	PORT_CONFSETTING(0x000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x400000, DEF_STR(On))
+	PORT_CONFNAME(0x800000, 0x000000, "Debug SHOW_NT Allow Front Replace")
+	PORT_CONFSETTING(0x000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x800000, DEF_STR(On))
+	PORT_CONFNAME(0x1000000, 0x0000000, "Debug SHOW_NT Disable DYUV Replace")
+	PORT_CONFSETTING(0x0000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x1000000, DEF_STR(On))
+	PORT_CONFNAME(0x2000000, 0x0000000, "Debug MiSTer Weight Math")
+	PORT_CONFSETTING(0x0000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x2000000, DEF_STR(On))
+	PORT_CONFNAME(0x4000000, 0x0000000, "Debug SHOW_NT Matte Replace")
+	PORT_CONFSETTING(0x0000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x4000000, DEF_STR(On))
+	PORT_CONFNAME(0x8000000, 0x0000000, "Debug Region Next Pixel")
+	PORT_CONFSETTING(0x0000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x8000000, DEF_STR(On))
+	PORT_CONFNAME(0x10000000, 0x00000000, "Debug Disable A Color Key")
+	PORT_CONFSETTING(0x00000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x10000000, DEF_STR(On))
+	PORT_CONFNAME(0x20000000, 0x00000000, "Debug Disable B Color Key")
+	PORT_CONFSETTING(0x00000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x20000000, DEF_STR(On))
+	PORT_CONFNAME(0x40000000, 0x00000000, "Debug GreenBook TCR OR")
+	PORT_CONFSETTING(0x00000000, DEF_STR(Off))
+	PORT_CONFSETTING(0x40000000, DEF_STR(On))
 INPUT_PORTS_END
 
 static INPUT_PORTS_START( cdimono2 )
@@ -463,6 +507,7 @@ void cdi_state::machine_start()
 {
 	m_dvc_timer = timer_alloc(FUNC(cdi_state::dvc_timer_tick), this);
 	m_dvc_video_timer = timer_alloc(FUNC(cdi_state::dvc_video_tick), this);
+	m_dvc_picture_timer = timer_alloc(FUNC(cdi_state::dvc_picture_tick), this);
 	m_dvc_audio_timer = timer_alloc(FUNC(cdi_state::dvc_audio_tick), this);
 
 	save_item(NAME(m_dvc_fma_command));
@@ -496,7 +541,12 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_fmv_window_width));
 	save_item(NAME(m_dvc_fmv_decoder_offset_y));
 	save_item(NAME(m_dvc_fmv_decoder_offset_x));
+	save_item(NAME(m_dvc_fmv_show_mode_state));
+	save_item(NAME(m_dvc_fmv_show_page));
+	save_item(NAME(m_dvc_fmv_visible));
+	save_item(NAME(m_dvc_fmv_show_pending_state));
 	save_item(NAME(m_dvc_fmv_program));
+	save_item(NAME(m_dvc_fmv_active_program));
 	save_item(NAME(m_dvc_fmv_demux_timestamp));
 	save_item(NAME(m_dvc_fmv_last_decoded_timestamp));
 	save_item(NAME(m_dvc_image_width));
@@ -507,8 +557,11 @@ void cdi_state::machine_start()
 
 	save_item(NAME(m_dvc_decoder_enabled));
 	save_item(NAME(m_dvc_playback_active));
+	save_item(NAME(m_dvc_playback_paused));
+	save_item(NAME(m_dvc_pause_pending));
 	save_item(NAME(m_dvc_video_visible));
 	save_item(NAME(m_dvc_video_show_pending));
+	save_item(NAME(m_dvc_video_show_mode));
 	save_item(NAME(m_dvc_fma_started));
 	save_item(NAME(m_dvc_fma_pending_stream_change));
 	save_item(NAME(m_dvc_audio_output_active));
@@ -519,6 +572,8 @@ void cdi_state::machine_start()
 	save_item(NAME(m_dvc_audio_empty_ticks));
 	save_item(NAME(m_dvc_fmv_register_update_latch));
 	save_item(NAME(m_dvc_fmv_register_update_scroll));
+	save_item(NAME(m_dvc_picture_eod_pending));
+	save_item(NAME(m_dvc_picture_irq_pending));
 	save_item(NAME(m_dvc_mpeg_ram_enabled));
 	save_item(NAME(m_cdic_irq_pending));
 	save_item(NAME(m_dvc_mpeg_ram_enable_count));
@@ -573,18 +628,26 @@ void quizard_state::machine_reset()
 *  Wait-State Handling     *
 ***************************/
 
-template<int Channel>
+template<int Window>
 uint16_t cdi_state::plane_r(offs_t offset, uint16_t mem_mask)
 {
-	m_maincpu->eat_cycles(m_mcd212->ram_dtack_cycle_count<Channel>());
-	return m_plane_ram[Channel][offset];
+	// TD=0 uses A18 for the physical bank and A21 for its lower/upper
+	// 256 KiB half (MCD212 table 4-1). These CPU windows are not planes.
+	const uint32_t address = (Window ? 0x200000U : 0U) | (uint32_t(offset) << 1);
+	const unsigned bank = BIT(address, 18);
+	const offs_t bank_offset = ((address & 0x0003ffffU) | (BIT(address, 21) ? 0x00040000U : 0U)) >> 1;
+	m_maincpu->eat_cycles(bank ? m_mcd212->ram_dtack_cycle_count<1>() : m_mcd212->ram_dtack_cycle_count<0>());
+	return m_plane_ram[bank][bank_offset];
 }
 
-template<int Channel>
+template<int Window>
 void cdi_state::plane_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	m_maincpu->eat_cycles(m_mcd212->ram_dtack_cycle_count<Channel>());
-	COMBINE_DATA(&m_plane_ram[Channel][offset]);
+	const uint32_t address = (Window ? 0x200000U : 0U) | (uint32_t(offset) << 1);
+	const unsigned bank = BIT(address, 18);
+	const offs_t bank_offset = ((address & 0x0003ffffU) | (BIT(address, 21) ? 0x00040000U : 0U)) >> 1;
+	m_maincpu->eat_cycles(bank ? m_mcd212->ram_dtack_cycle_count<1>() : m_mcd212->ram_dtack_cycle_count<0>());
+	COMBINE_DATA(&m_plane_ram[bank][bank_offset]);
 }
 
 uint16_t cdi_state::main_rom_r(offs_t offset)
@@ -720,6 +783,8 @@ void cdi_state::dvc_reset_demux(dvc_demux_state &state)
 
 void cdi_state::dvc_restore_state()
 {
+	dvc_commit_active_video_map(m_dvc_fmv_active_program);
+	dvc_update_video_show_pending();
 	dvc_rebuild_external_video();
 	dvc_update_irq_timer();
 	dvc_update_video_timer();
@@ -730,16 +795,58 @@ void cdi_state::dvc_restore_state()
 
 void cdi_state::dvc_apply_video_show_mode()
 {
-	const uint8_t mode = (m_dvc_video_visible && (m_dvc_video_show_mode == DVC_SHOW_NT))
-		? uint8_t(mcd212_device::EXTERNAL_VIDEO_BETWEEN_PLANES)
-		: uint8_t(mcd212_device::EXTERNAL_VIDEO_BACKDROP);
-	m_mcd212->set_external_video_mode(mode);
+	dvc_apply_video_show_mode(m_dvc_video_visible, m_dvc_video_show_mode);
+}
+
+void cdi_state::dvc_apply_video_show_mode(bool visible, uint8_t mode)
+{
+	// MV_Show/MV_Hide controls whether the active map supplies the MCD212's
+	// external-video input. Keep this as a separate, frame-latched select signal:
+	// the title's ICM and region program still decides where the backdrop is
+	// exposed, and descriptor writes to an inactive map cannot disturb it.
+	const bool select_external_video = visible && (mode != DVC_SHOW_HIDDEN);
+	m_mcd212->set_external_video_select(select_external_video);
+	// SHOW_NT replaces the previous non-transparent movie map. Until the full
+	// CD-RTOS map hand-off is emulated, preserve only pixels that change after
+	// the movie starts so controls and hover highlights remain above MPEG while
+	// stale full-screen pages yield to it.
+	m_mcd212->set_external_video_mode(select_external_video && mode == DVC_SHOW_NT
+		? mcd212_device::EXTERNAL_VIDEO_BETWEEN_PLANES
+		: mcd212_device::EXTERNAL_VIDEO_BACKDROP);
+}
+
+void cdi_state::dvc_commit_active_video_map(uint16_t program)
+{
+	m_dvc_fmv_active_program = program;
+	const size_t index = std::min<size_t>(program, DVC_FMV_PROGRAM_SLOTS - 1);
+	m_dvc_video_visible = m_dvc_fmv_visible[index] != 0;
+	m_dvc_video_show_mode = m_dvc_fmv_show_mode_state[index];
+}
+
+void cdi_state::dvc_update_video_show_pending()
+{
+	m_dvc_video_show_pending = std::any_of(
+		m_dvc_fmv_show_pending_state.begin(),
+		m_dvc_fmv_show_pending_state.end(),
+		[](uint8_t state) { return state == DVC_VISIBILITY_SHOW_NEXT_PICTURE; });
 }
 
 void cdi_state::dvc_update_irq_timer()
 {
 	if (!m_dvc_timer)
 		return;
+
+	// The FMV timer should not free-run while the movie engine is idle. Leaving
+	// it active after reset/pause causes stray TIM IRQs that confuse titles into
+	// thinking playback or disc state has gone bad.
+	if (!m_dvc_decoder_enabled
+		&& !m_dvc_playback_active
+		&& !m_dvc_video_show_pending
+		&& !m_dvc_fmv_register_update_latch)
+	{
+		m_dvc_timer->adjust(attotime::never);
+		return;
+	}
 
 	const uint32_t ticks = (uint32_t(m_dvc_fmv_timer_compare) + 1U) * 8U;
 	const attotime period = attotime::from_ticks(ticks ? ticks : 1U, 45000);
@@ -761,11 +868,20 @@ void cdi_state::dvc_update_video_timer()
 	const uint32_t frame_period_90khz = std::max<uint32_t>(1U, dvc_frame_period_90khz(m_dvc_frame_rate_hz > 0.0 ? m_dvc_frame_rate_hz : 25.0));
 	const attotime period = attotime::from_ticks(frame_period_90khz, 90000);
 
+	// VMPEG first announces a potential picture at the end of VSYNC.  For the
+	// PAL full-height timing used by Mono-I this is 23 lines before active video
+	// (MCD212 table 5-6: VSYNC ends at line 3, active video starts at line 26).
+	// MAME's active area starts at physical line 32, so phase the presenter to
+	// line 9.  Keeping the periodic timer locked to this point also prevents
+	// decode/DMA timing from moving picture changes into active display.
+	const int potential_picture_line = std::max(0, m_screen->visible_area().min_y - 23);
+	const attotime first = m_screen->time_until_pos(potential_picture_line, 0);
+
 	// Decode happens more often than display. If we restart the presenter timer
 	// on every new packet/frame decode, it can be pushed out indefinitely and
 	// the display gets stuck on the first seeded frame.
 	if (!m_dvc_video_timer->enabled() || (m_dvc_video_timer->period() != period))
-		m_dvc_video_timer->adjust(period, 0, period);
+		m_dvc_video_timer->adjust(first, 0, period);
 }
 
 void cdi_state::dvc_update_audio_timer()
@@ -813,7 +929,7 @@ void cdi_state::dvc_update_audio_dac_fill()
 
 void cdi_state::dvc_flush_audio_output(size_t max_samples)
 {
-	if (!m_dvc_audio_output_active || !m_dvc_audio_sample_rate)
+	if (m_dvc_playback_paused || !m_dvc_audio_output_active || !m_dvc_audio_sample_rate)
 		return;
 
 	dvc_update_audio_dac_fill();
@@ -846,24 +962,39 @@ void cdi_state::dvc_flush_audio_output(size_t max_samples)
 
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_timer_tick)
 {
+	if (m_dvc_pause_pending)
+	{
+		m_dvc_pause_pending = false;
+		dvc_raise_fmv_irq(DVC_FMV_ISR_PAI);
+	}
+
+	if (!m_dvc_decoder_enabled
+		&& !m_dvc_playback_active
+		&& !m_dvc_video_show_pending
+		&& !m_dvc_fmv_register_update_latch)
+	{
+		m_dvc_timer->adjust(attotime::never);
+		m_dvc_fmv_interrupt_status &= ~DVC_FMV_ISR_TIM;
+		dvc_update_irq();
+		return;
+	}
+
 	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
 	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
 	m_mcd212->set_debug_video_mask(uint32_t(debug >> 4));
 	dvc_raise_fmv_irq(DVC_FMV_ISR_TIM);
 	if (m_dvc_fma_started)
 		dvc_raise_fma_irq(DVC_FMA_ISR_POLL);
-	if (m_dvc_fmv_register_update_latch && m_dvc_fmv_register_update_scroll)
-	{
-		m_dvc_fmv_register_update_latch = false;
-		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP | DVC_FMV_ISR_DCL);
-	}
+	// A scrolling register update is accepted on the next vertical retrace, not
+	// on the 5.625 kHz DVC timer.  The frame presentation path commits it at
+	// the first eligible display boundary, together with the corresponding PIC.
 }
 
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_video_tick)
 {
 	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
 	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
-	m_mcd212->set_debug_video_mask(uint16_t((debug >> 4) & 0x7ff));
+	m_mcd212->set_debug_video_mask(uint32_t(debug >> 4));
 	if (!m_dvc_playback_active)
 		return;
 
@@ -876,11 +1007,32 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_video_tick)
 	dvc_present_next_frame();
 }
 
+TIMER_CALLBACK_MEMBER(cdi_state::dvc_picture_tick)
+{
+	// The potential-picture event occurs at the end of VSYNC, while PIC is
+	// generated only when the picture actually starts at the end of VBLANK.
+	// Keeping these as separate scheduler events gives CD-RTOS time to process
+	// VCUP/DCL and switch its display map before active video begins.
+	dvc_raise_fmv_irq(m_dvc_picture_irq_pending);
+	m_dvc_picture_irq_pending = 0;
+	if (m_dvc_picture_eod_pending)
+	{
+		m_dvc_picture_eod_pending = false;
+		dvc_raise_fmv_irq(DVC_FMV_ISR_EOD);
+	}
+}
+
 TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 {
+	// A synchronized MV pause holds audio output as well as the displayed
+	// picture. Keep the decoder/FIFO intact for Continue; do not let incoming
+	// DMA commands implicitly resume the presentation clock.
+	if (m_dvc_playback_paused)
+		return;
+
 	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
 	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
-	m_mcd212->set_debug_video_mask(uint16_t((debug >> 4) & 0x7ff));
+	m_mcd212->set_debug_video_mask(uint32_t(debug >> 4));
 	const uint32_t current_dclk = uint32_t(machine().time().as_ticks(45000) - m_dvc_dclk_base);
 	m_dvc_fma_dclk = current_dclk;
 	constexpr size_t chunk_samples = DVC_AUDIO_OUTPUT_CHUNK_SAMPLES;
@@ -905,7 +1057,8 @@ TIMER_CALLBACK_MEMBER(cdi_state::dvc_audio_tick)
 	if (!m_dvc_audio_output_active
 		&& m_dvc_fma_started
 		&& m_dvc_audio_demux_state.system_clock_reference_start_time_valid
-		&& int64_t(current_dclk) >= m_dvc_audio_demux_state.system_clock_reference_start_time)
+		&& int64_t(current_dclk) >= m_dvc_audio_demux_state.system_clock_reference_start_time
+		&& (m_dvc_video_presentation_started || m_dvc_video_queue.empty()))
 	{
 		if (available_samples >= resume_threshold)
 		{
@@ -1023,17 +1176,22 @@ void cdi_state::dvc_reset()
 	m_dvc_fmv_decoder_command = 0;
 	m_dvc_fmv_video_data_input_command = 0;
 	m_dvc_fmv_stream = 0;
-	m_dvc_fmv_y_offset = 0;
-	m_dvc_fmv_x_offset = 0;
-	m_dvc_fmv_y_active = 0;
-	m_dvc_fmv_x_active = 0;
-	m_dvc_fmv_y_display = 0;
-	m_dvc_fmv_x_display = 0;
-	m_dvc_fmv_window_height = 0;
-	m_dvc_fmv_window_width = 0;
-	m_dvc_fmv_decoder_offset_y = 0;
-	m_dvc_fmv_decoder_offset_x = 0;
+	m_dvc_fmv_y_offset.fill(0);
+	m_dvc_fmv_x_offset.fill(0);
+	m_dvc_fmv_y_active.fill(0);
+	m_dvc_fmv_x_active.fill(0);
+	m_dvc_fmv_y_display.fill(0);
+	m_dvc_fmv_x_display.fill(0);
+	m_dvc_fmv_window_height.fill(0);
+	m_dvc_fmv_window_width.fill(0);
+	m_dvc_fmv_decoder_offset_y.fill(0);
+	m_dvc_fmv_decoder_offset_x.fill(0);
+	m_dvc_fmv_show_mode_state.fill(uint8_t(DVC_SHOW_HIDDEN));
+	m_dvc_fmv_show_page.fill(0);
+	m_dvc_fmv_visible.fill(0);
+	m_dvc_fmv_show_pending_state.fill(0);
 	m_dvc_fmv_program = 0;
+	m_dvc_fmv_active_program = 0;
 	m_dvc_image_width = 0;
 	m_dvc_image_height = 0;
 	m_dvc_image_rt = 0;
@@ -1042,8 +1200,12 @@ void cdi_state::dvc_reset()
 
 	m_dvc_decoder_enabled = false;
 	m_dvc_playback_active = false;
+	m_dvc_playback_paused = false;
+	m_dvc_pause_pending = false;
+	m_dvc_video_presentation_started = false;
 	m_dvc_video_visible = false;
 	m_dvc_video_show_pending = false;
+	m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
 	m_dvc_fmv_program_end_seen = false;
 	m_dvc_fma_started = false;
 	m_dvc_fma_pending_stream_change = false;
@@ -1052,6 +1214,10 @@ void cdi_state::dvc_reset()
 	m_dvc_audio_last_decoded_valid = false;
 	m_dvc_fmv_register_update_latch = false;
 	m_dvc_fmv_register_update_scroll = false;
+	m_dvc_picture_eod_pending = false;
+	m_dvc_picture_irq_pending = 0;
+	if (m_dvc_picture_timer)
+		m_dvc_picture_timer->adjust(attotime::never);
 	m_dvc_mpeg_ram_enabled = false;
 	m_dvc_mpeg_ram_enable_count = 0;
 	m_dvc_dma_preview_count = 0;
@@ -1088,7 +1254,11 @@ void cdi_state::dvc_reset()
 
 void cdi_state::dvc_reset_video_decoder()
 {
+	m_dvc_picture_irq_pending = 0;
 	LOGMASKED(LOG_DVC, "%s: DVC reset video decoder\n", machine().describe_context());
+	m_dvc_picture_eod_pending = false;
+	if (m_dvc_picture_timer)
+		m_dvc_picture_timer->adjust(attotime::never);
 	if (m_dvc_video_plm)
 	{
 		plm_video_destroy(m_dvc_video_plm);
@@ -1098,9 +1268,13 @@ void cdi_state::dvc_reset_video_decoder()
 
 	m_dvc_video_queue.clear();
 	m_dvc_display_frame = dvc_video_frame();
+	m_dvc_video_presentation_started = false;
 	m_dvc_image_width = 0;
 	m_dvc_image_height = 0;
 	m_dvc_image_rt = 0;
+	m_dvc_fmv_demux_timestamp = 0;
+	m_dvc_fmv_last_decoded_timestamp = 0;
+	m_dvc_frame_rate_hz = 25.0;
 	m_dvc_fmv_program_end_seen = false;
 	m_dvc_fmv_video_data_input_command &= ~0x4000;
 	dvc_reset_demux(m_dvc_video_demux_state);
@@ -1153,7 +1327,8 @@ void cdi_state::dvc_log_video_state(const char *reason, bool force)
 		(m_dvc_decoder_enabled ? 0x00000008 : 0x00000000) |
 		(uint32_t(m_dvc_video_show_mode & 0x03) << 4) |
 		(uint32_t(std::min<size_t>(m_dvc_video_queue.size(), 0xff)) << 8) |
-		(uint32_t(m_dvc_fmv_system_command) << 16);
+		(uint32_t(m_dvc_fmv_system_command) << 16) |
+		(uint32_t(dvc_fmv_program_index() & 0x0f) << 28);
 
 	if (!force
 		&& (signature == m_dvc_last_video_log_signature)
@@ -1167,9 +1342,12 @@ void cdi_state::dvc_log_video_state(const char *reason, bool force)
 	m_dvc_last_video_log_frame_w = m_dvc_display_frame.width;
 	m_dvc_last_video_log_frame_h = m_dvc_display_frame.height;
 
-	LOGMASKED(LOG_DVC, "%s: DVC video state [%s] vis=%d show_pending=%d mode=%u play=%d dec=%d queue=%u frame=%ux%u sys=%04x vid=%04x ev_pending=%d ev_active=%d ev_dirty=%d icm_ev=%d\n",
+	LOGMASKED(LOG_DVC, "%s: DVC video state [%s] prog=%04x slot=%u page=%u vis=%d show_pending=%d mode=%u play=%d dec=%d queue=%u frame=%ux%u sys=%04x vid=%04x ev_pending=%d ev_active=%d ev_dirty=%d icm_ev=%d\n",
 		machine().describe_context(),
 		reason,
+		m_dvc_fmv_program,
+		unsigned(dvc_fmv_program_index()),
+		unsigned(dvc_fmv_show_page()),
 		m_dvc_video_visible ? 1 : 0,
 		m_dvc_video_show_pending ? 1 : 0,
 		unsigned(m_dvc_video_show_mode),
@@ -1229,66 +1407,91 @@ void cdi_state::dvc_handle_fmv_command(uint16_t data)
 	{
 		m_dvc_decoder_enabled = false;
 		m_dvc_playback_active = false;
-		m_dvc_video_visible = false;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
+		m_dvc_playback_paused = false;
+		m_dvc_pause_pending = false;
+		m_dvc_fmv_interrupt_status &= ~DVC_FMV_ISR_TIM;
+		const size_t active_slot = std::min<size_t>(m_dvc_fmv_active_program, DVC_FMV_PROGRAM_SLOTS - 1);
+		m_dvc_fmv_visible[active_slot] = 0;
+		m_dvc_fmv_show_pending_state[active_slot] = DVC_VISIBILITY_STABLE;
+		m_dvc_fmv_show_mode_state[active_slot] = DVC_SHOW_HIDDEN;
+		dvc_commit_active_video_map(m_dvc_fmv_active_program);
+		dvc_update_video_show_pending();
 		dvc_reset_video_decoder();
 		dvc_rebuild_external_video();
+		dvc_update_irq();
 	}
 
 	if (data & 0x0100)
 	{
 		m_dvc_playback_active = false;
-		m_dvc_video_visible = false;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
+		m_dvc_playback_paused = false;
+		m_dvc_pause_pending = false;
+		m_dvc_decoder_enabled = false;
+		m_dvc_fmv_interrupt_status &= ~DVC_FMV_ISR_TIM;
+		// VMPEG 0x0100 clears the compressed-video FIFO.  Keeping the old
+		// decoder and queued picture here makes the next program start with a
+		// stale frame while its audio is already using the new SCR timeline.
+		// Reset only decoder-owned state; MV map/window descriptors remain live.
 		dvc_reset_video_decoder();
-		dvc_rebuild_external_video();
+		m_mcd212->set_external_video_mode(mcd212_device::EXTERNAL_VIDEO_BACKDROP);
+		dvc_update_irq();
 	}
 
 	if (data & 0x1000)
 		m_dvc_decoder_enabled = true;
 
-	if (data & 0x8000)
+	if ((data & 0x8000) && m_dvc_decoder_enabled)
 		dvc_handle_dma_transfer(true);
 
 	if (data & 0x0008)
 	{
 		m_dvc_playback_active = true;
+		m_dvc_playback_paused = false;
+		m_dvc_pause_pending = false;
 		m_dvc_decoder_enabled = true;
-		if (m_dvc_display_frame.pixels.empty() && !m_dvc_video_queue.empty())
-			dvc_present_next_frame();
+		m_dvc_video_presentation_started = false;
 	}
 
 	if (data & 0x0010)
 	{
 		m_dvc_playback_active = false;
-		m_dvc_video_visible = false;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
-		dvc_rebuild_external_video();
+		m_dvc_playback_paused = (m_dvc_fmv_interrupt_enable & DVC_FMV_ISR_PAI) != 0;
+		m_dvc_pause_pending = true;
+		// SYSCMD bit 4 is Pause, not Stop. CD-RTOS waits for PAI before
+		// completing MV_Pause/MV_Freeze. Retain the current picture and map,
+		// including the SHOW_NT overlay baseline, while acknowledging it.
+		// The VMPEG driver's abort/cleanup path also writes Pause, after
+		// disabling playback interrupts (leaving only VCUP enabled). In that
+		// case the Green Book retains the last picture as a backdrop, but the
+		// native menu map must no longer be suppressed by our SHOW_NT workaround.
+		if (!m_dvc_playback_paused)
+			m_mcd212->set_external_video_mode(mcd212_device::EXTERNAL_VIDEO_BACKDROP);
+		dvc_update_irq_timer();
 	}
 
 	if (data & 0x0020)
 	{
 		m_dvc_playback_active = true;
-		if (m_dvc_display_frame.pixels.empty() && !m_dvc_video_queue.empty())
-			dvc_present_next_frame();
+		m_dvc_playback_paused = false;
+		m_dvc_pause_pending = false;
+		m_dvc_decoder_enabled = true;
 	}
 
 	if (data & 0x0040)
 	{
 		m_dvc_playback_active = false;
+		m_dvc_playback_paused = true;
 		dvc_present_next_frame();
 	}
 
 	if (data & 0x0080)
 	{
 		m_dvc_playback_active = false;
-		m_dvc_video_visible = false;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
-		dvc_rebuild_external_video();
+		m_dvc_playback_paused = false;
+		m_dvc_pause_pending = false;
+		m_dvc_fmv_interrupt_status &= ~DVC_FMV_ISR_TIM;
+		m_mcd212->set_external_video_mode(mcd212_device::EXTERNAL_VIDEO_BACKDROP);
+		dvc_update_irq();
 	}
 
 	dvc_update_video_timer();
@@ -1299,41 +1502,83 @@ void cdi_state::dvc_handle_fmv_video_command(uint16_t data)
 {
 	LOGMASKED(LOG_DVC, "%s: DVC FMV video command %04x\n", machine().describe_context(), data);
 	m_dvc_fmv_video_command = data;
+	// VIDCMD is a bitfield (0008 RegsUpd, 0020 VidOn, 0100 Hide,
+	// 0200 Show, 0400 Show on next picture).  MV_Show's page argument belongs
+	// to the CD-RTOS descriptor and is not encoded in the low byte of VIDCMD.
 
-	const bool show_t = (data & 0x0020) && !(data & 0x0200) && !(data & 0x0400);
+	const bool video_on = (data & 0x0020) != 0;
 	const bool show_nt = (data & 0x0200) != 0;
 	const bool show_pending_nt = (data & 0x0400) != 0;
-	const bool hide_only = (data & 0x0100) && !show_t && !show_nt && !show_pending_nt;
+	const bool hide_only = (data & 0x0100) && !show_nt && !show_pending_nt;
+	const uint32_t debug_video = m_debug_layers ? (uint32_t(m_debug_layers->read()) >> 4) : 0;
+	if ((debug_video & (mcd212_device::DEBUG_VIDEO_LOG_SHOWNT | mcd212_device::DEBUG_VIDEO_LOG_PLANE_STATS)) != 0)
+	{
+		const size_t slot = dvc_fmv_program_index();
+		logerror("DVC FMV video cmd data=%04x page=%02x vid_on=%d show=%d show_next=%d hide=%d program=%u slot=%u cur_vis=%d cur_mode=%u stored_vis=%u stored_mode=%u pos=(%u,%u) active=(%u,%u) win=(%u,%u) dec_off=(%u,%u)\n",
+			data,
+			dvc_fmv_show_page(),
+			video_on ? 1 : 0,
+			show_nt ? 1 : 0,
+			show_pending_nt ? 1 : 0,
+			hide_only ? 1 : 0,
+			m_dvc_fmv_program,
+			uint32_t(slot),
+			m_dvc_video_visible ? 1 : 0,
+			m_dvc_video_show_mode,
+			m_dvc_fmv_visible[slot],
+			m_dvc_fmv_show_mode_state[slot],
+			m_dvc_fmv_x_display[slot],
+			m_dvc_fmv_y_display[slot],
+			m_dvc_fmv_x_active[slot],
+			m_dvc_fmv_y_active[slot],
+			m_dvc_fmv_window_width[slot],
+			m_dvc_fmv_window_height[slot],
+			m_dvc_fmv_decoder_offset_x[slot],
+			m_dvc_fmv_decoder_offset_y[slot]);
+	}
 
 	if (hide_only)
 	{
-		m_dvc_video_visible = false;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
-		dvc_rebuild_external_video();
-	}
-
-	if (show_t)
-	{
-		m_dvc_video_visible = true;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_T;
-		dvc_rebuild_external_video();
+		const size_t slot = dvc_fmv_program_index();
+		m_dvc_fmv_visible[slot] = 0;
+		m_dvc_fmv_show_pending_state[slot] = DVC_VISIBILITY_STABLE;
+		m_dvc_fmv_show_mode_state[slot] = DVC_SHOW_HIDDEN;
+		if (slot == std::min<size_t>(m_dvc_fmv_active_program, DVC_FMV_PROGRAM_SLOTS - 1))
+		{
+			dvc_commit_active_video_map(m_dvc_fmv_active_program);
+			dvc_rebuild_external_video();
+		}
 	}
 
 	if (show_nt)
 	{
-		m_dvc_video_visible = true;
-		m_dvc_video_show_pending = false;
-		m_dvc_video_show_mode = DVC_SHOW_NT;
-		dvc_rebuild_external_video();
+		const size_t slot = dvc_fmv_program_index();
+		m_dvc_fmv_show_mode_state[slot] = DVC_SHOW_NT;
+		if (m_dvc_playback_active)
+		{
+			m_dvc_fmv_show_pending_state[slot] = DVC_VISIBILITY_SHOW_NEXT_PICTURE;
+		}
+		else
+		{
+			// With no active MPEG play, MV_Show takes effect at vertical retrace.
+			// The MCD212 external-video buffer itself is committed at that boundary.
+			m_dvc_fmv_visible[slot] = 1;
+			m_dvc_fmv_show_pending_state[slot] = DVC_VISIBILITY_STABLE;
+			if (slot == std::min<size_t>(m_dvc_fmv_active_program, DVC_FMV_PROGRAM_SLOTS - 1))
+			{
+				dvc_commit_active_video_map(m_dvc_fmv_active_program);
+				dvc_rebuild_external_video();
+			}
+		}
 	}
 
 	if (show_pending_nt)
 	{
-		m_dvc_video_show_pending = true;
-		m_dvc_video_show_mode = DVC_SHOW_NT;
+		const size_t slot = dvc_fmv_program_index();
+		m_dvc_fmv_show_mode_state[slot] = DVC_SHOW_NT;
+		m_dvc_fmv_show_pending_state[slot] = DVC_VISIBILITY_SHOW_NEXT_PICTURE;
 	}
+	dvc_update_video_show_pending();
 
 	if (data & 0x0008)
 	{
@@ -1551,8 +1796,17 @@ void cdi_state::dvc_process_demux_byte(bool video, uint8_t data)
 		demux.decoding_timestamp_updated = true;
 		if (!demux.system_clock_reference_start_time_valid)
 		{
+			const int64_t clock_delta = dvc_mpeg_clock_delta(demux.presentation_timestamp, demux.system_clock_reference);
 			demux.system_clock_reference_start_time_valid = true;
-			demux.system_clock_reference_start_time = int64_t(dclk) + int64_t(demux.presentation_timestamp >> 1) - int64_t(demux.system_clock_reference >> 1);
+			demux.system_clock_reference_start_time = int64_t(dclk) + (clock_delta / 2);
+			LOGMASKED(LOG_DVC, "%s: DVC demux %s clock anchor dclk=%u pts=%09llx scr=%09llx delta90=%lld start=%lld\n",
+				machine().describe_context(),
+				video ? "FMV" : "FMA",
+				unsigned(dclk),
+				(unsigned long long)(demux.presentation_timestamp & ((uint64_t(1) << 33) - 1)),
+				(unsigned long long)(demux.system_clock_reference & ((uint64_t(1) << 33) - 1)),
+				(long long)clock_delta,
+				(long long)demux.system_clock_reference_start_time);
 		}
 		LOGMASKED(LOG_DVC, "%s: DVC demux %s timestamp=%04x stream=%x\n",
 			machine().describe_context(),
@@ -1828,6 +2082,10 @@ void cdi_state::dvc_decode_video()
 		dvc_video_frame queued;
 		queued.width = frame->width;
 		queued.height = frame->height;
+		queued.program = m_dvc_fmv_program;
+		// Geometry and visibility are committed when a picture begins display,
+		// not when pl_mpeg happens to finish decoding it.  CD-RTOS programs map
+		// descriptors ahead of time and relies on this boundary for MV_Show.
 		queued.pixels.resize(size_t(frame->width) * size_t(frame->height));
 
 		std::vector<uint8_t> rgba(size_t(frame->width) * size_t(frame->height) * 4);
@@ -1889,6 +2147,8 @@ void cdi_state::dvc_decode_audio()
 	{
 		if (decoded_frames >= DVC_AUDIO_MAX_FRAMES_PER_DECODE)
 			break;
+		// A preceding iteration may have compacted the elementary stream.
+		const int limit_bits = int(m_dvc_audio_es_bytes * 8U);
 		const int start_bitpos = m_dvc_audio_es_bitpos;
 		const int frame_bytes = dvc_peek_l2_frame_bytes(m_dvc_audio_es, m_dvc_audio_es_bytes, start_bitpos);
 		if ((frame_bytes > 0) && ((start_bitpos + frame_bytes * 8) > limit_bits))
@@ -2034,6 +2294,25 @@ void cdi_state::dvc_decode_audio()
 	}
 }
 
+void cdi_state::dvc_latch_frame_descriptor(dvc_video_frame &frame)
+{
+	const size_t slot = std::min<size_t>(frame.program, DVC_FMV_PROGRAM_SLOTS - 1);
+
+	frame.y_offset = m_dvc_fmv_y_offset[slot];
+	frame.x_offset = m_dvc_fmv_x_offset[slot];
+	frame.y_active = m_dvc_fmv_y_active[slot];
+	frame.x_active = m_dvc_fmv_x_active[slot];
+	frame.y_display = m_dvc_fmv_y_display[slot];
+	frame.x_display = m_dvc_fmv_x_display[slot];
+	frame.window_height = m_dvc_fmv_window_height[slot];
+	frame.window_width = m_dvc_fmv_window_width[slot];
+	frame.decoder_offset_y = m_dvc_fmv_decoder_offset_y[slot];
+	frame.decoder_offset_x = m_dvc_fmv_decoder_offset_x[slot];
+	frame.show_page = m_dvc_fmv_show_page[slot];
+	frame.visible = m_dvc_fmv_visible[slot];
+	frame.show_mode = m_dvc_fmv_show_mode_state[slot];
+}
+
 void cdi_state::dvc_present_next_frame()
 {
 	if (m_dvc_video_queue.empty())
@@ -2041,6 +2320,12 @@ void cdi_state::dvc_present_next_frame()
 
 	m_dvc_display_frame = std::move(m_dvc_video_queue.front());
 	m_dvc_video_queue.pop_front();
+	// Green Book IX.8.2.3 MV_Signal: SOS belongs to the first displayed
+	// intra picture, not to input/decode completion. The ROM maps SEQ to
+	// SOS/GOP/PIC; titles wait for it before enabling their transport controls.
+	m_dvc_picture_irq_pending = m_dvc_video_presentation_started
+		? DVC_FMV_ISR_PIC : DVC_FMV_ISR_SEQ;
+	m_dvc_video_presentation_started = true;
 	const bool last_program_frame =
 		m_dvc_fmv_program_end_seen &&
 		m_dvc_video_queue.empty() &&
@@ -2075,70 +2360,97 @@ void cdi_state::dvc_present_next_frame()
 		sample_luma_min,
 		sample_luma_max);
 
-	if (m_dvc_video_show_pending)
+	const size_t frame_slot = std::min<size_t>(m_dvc_display_frame.program, DVC_FMV_PROGRAM_SLOTS - 1);
+	if (m_dvc_fmv_show_pending_state[frame_slot] == DVC_VISIBILITY_SHOW_NEXT_PICTURE)
 	{
-		m_dvc_video_show_pending = false;
-		m_dvc_video_visible = true;
-		m_dvc_video_show_mode = DVC_SHOW_NT;
+		m_dvc_fmv_visible[frame_slot] = 1;
+		m_dvc_fmv_show_pending_state[frame_slot] = DVC_VISIBILITY_STABLE;
 	}
-	if (m_dvc_fmv_register_update_latch && !m_dvc_fmv_register_update_scroll)
+	dvc_commit_active_video_map(m_dvc_display_frame.program);
+	dvc_update_video_show_pending();
+	if (m_dvc_fmv_register_update_latch)
 	{
 		m_dvc_fmv_register_update_latch = false;
 		dvc_raise_fmv_irq(DVC_FMV_ISR_VCUP | DVC_FMV_ISR_DCL);
 	}
+	dvc_latch_frame_descriptor(m_dvc_display_frame);
 
 	dvc_log_video_state("present frame", true);
 	dvc_rebuild_external_video();
-	dvc_raise_fmv_irq(DVC_FMV_ISR_PIC);
+
+	// MiSTer and Green Book timing both separate the potential-picture update
+	// at VSYNC end from PIC at active-video start.  The presenter is phased to
+	// the former; deliver PIC at the main screen's first active line.
+	m_dvc_picture_eod_pending = last_program_frame;
 	if (last_program_frame)
-	{
 		m_dvc_fmv_program_end_seen = false;
-		dvc_raise_fmv_irq(DVC_FMV_ISR_EOD);
-	}
+	m_dvc_picture_timer->adjust(m_screen->time_until_pos(m_screen->visible_area().min_y, 0));
 }
 
 void cdi_state::dvc_rebuild_external_video()
 {
 	const uint32_t debug = m_debug_layers ? uint32_t(m_debug_layers->read()) : uint32_t(mcd212_device::DEBUG_LAYER_ALL);
 	m_mcd212->set_debug_layer_mask(uint8_t(debug & uint32_t(mcd212_device::DEBUG_LAYER_ALL)));
-	m_mcd212->set_debug_video_mask(uint16_t((debug >> 4) & 0x7ff));
+	m_mcd212->set_debug_video_mask(uint32_t(debug >> 4));
 	m_mcd212->clear_external_video();
+	const uint16_t frame_program = m_dvc_display_frame.program;
+	const size_t frame_slot = std::min<size_t>(frame_program, DVC_FMV_PROGRAM_SLOTS - 1);
+	const uint16_t frame_y_offset = m_dvc_display_frame.y_offset;
+	const uint16_t frame_x_offset = m_dvc_display_frame.x_offset;
+	const uint16_t frame_y_active = m_dvc_display_frame.y_active;
+	const uint16_t frame_x_active = m_dvc_display_frame.x_active;
+	const uint16_t frame_y_display = m_dvc_display_frame.y_display;
+	const uint16_t frame_x_display = m_dvc_display_frame.x_display;
+	const uint16_t frame_window_height = m_dvc_display_frame.window_height;
+	const uint16_t frame_window_width = m_dvc_display_frame.window_width;
+	const uint16_t frame_decoder_offset_y = m_dvc_display_frame.decoder_offset_y;
+	const uint16_t frame_decoder_offset_x = m_dvc_display_frame.decoder_offset_x;
+	const bool frame_visible = m_dvc_video_visible;
+	const uint8_t frame_show_mode = m_dvc_video_show_mode;
 	LOGMASKED(LOG_DVC, "%s: DVC rebuild ext video visible=%d pixels=%u active=%dx%d window=%dx%d display=%dx%d offset=%dx%d crop=%dx%d\n",
 		machine().describe_context(),
-		m_dvc_video_visible ? 1 : 0,
+		frame_visible ? 1 : 0,
 		unsigned(m_dvc_display_frame.pixels.size()),
-		m_dvc_fmv_x_active,
-		m_dvc_fmv_y_active,
-		m_dvc_fmv_window_width,
-		m_dvc_fmv_window_height,
-		m_dvc_fmv_x_display,
-		m_dvc_fmv_y_display,
-		m_dvc_fmv_x_offset,
-		m_dvc_fmv_y_offset,
-		m_dvc_fmv_decoder_offset_x,
-		m_dvc_fmv_decoder_offset_y);
+		frame_x_active,
+		frame_y_active,
+		frame_window_width,
+		frame_window_height,
+		frame_x_display,
+		frame_y_display,
+		frame_x_offset,
+		frame_y_offset,
+		frame_decoder_offset_x,
+		frame_decoder_offset_y);
+	LOGMASKED(LOG_DVC, "%s: DVC rebuild ext video program=%u slot=%u page=%u frame_mode=%u global_mode=%u\n",
+		machine().describe_context(),
+		unsigned(frame_program),
+		unsigned(frame_slot),
+		unsigned(m_dvc_display_frame.show_page),
+		unsigned(m_dvc_display_frame.show_mode),
+		unsigned(m_dvc_video_show_mode));
 	dvc_log_video_state("rebuild ext video");
+	m_mcd212->set_external_video_page(m_dvc_display_frame.show_page);
 
-	if (!m_dvc_video_visible || m_dvc_display_frame.pixels.empty())
+	if (!frame_visible || m_dvc_display_frame.pixels.empty())
 	{
 		LOGMASKED(LOG_DVC, "%s: DVC ext video skip reason=%s\n",
 			machine().describe_context(),
-			!m_dvc_video_visible ? "hidden" : "no display frame");
-		dvc_apply_video_show_mode();
+			!frame_visible ? "active map hidden" : "no display frame");
+		dvc_apply_video_show_mode(frame_visible, frame_show_mode);
 		m_mcd212->set_external_video_enable(false);
 		return;
 	}
 
 	bitmap_rgb32 &bitmap = m_mcd212->external_video();
-	const int src_x = std::min<int>(m_dvc_fmv_decoder_offset_x, m_dvc_display_frame.width);
-	const int src_y = std::min<int>(m_dvc_fmv_decoder_offset_y, m_dvc_display_frame.height);
+	const int src_x = std::min<int>(frame_decoder_offset_x, m_dvc_display_frame.width);
+	const int src_y = std::min<int>(frame_decoder_offset_y, m_dvc_display_frame.height);
 	const int max_copy_w = int(m_dvc_display_frame.width) - src_x;
 	const int max_copy_h = int(m_dvc_display_frame.height) - src_y;
 	// Repeat Offender programs tiny DECWIN values while still using a normal
 	// 384x280 active FMV area. Treat 0/1-sized DECWIN as "no explicit crop",
 	// and scale the decoded source into the active output rectangle.
-	const int source_w = std::max(0, std::min<int>((m_dvc_fmv_window_width > 1) ? m_dvc_fmv_window_width : max_copy_w, max_copy_w));
-	const int source_h = std::max(0, std::min<int>((m_dvc_fmv_window_height > 1) ? m_dvc_fmv_window_height : max_copy_h, max_copy_h));
+	const int source_w = std::max(0, std::min<int>((frame_window_width > 1) ? frame_window_width : max_copy_w, max_copy_w));
+	const int source_h = std::max(0, std::min<int>((frame_window_height > 1) ? frame_window_height : max_copy_h, max_copy_h));
 	// MiSTer's frame player uses the decoded/window dimensions for the actual
 	// displayed picture area; the "active" registers don't appear to size the
 	// final overlay. Horizontal units are half-resolution relative to the
@@ -2149,18 +2461,26 @@ void cdi_state::dvc_rebuild_external_video()
 	// placement, while others program explicit display positions.
 	// Both Xd and Xo are programmed in half-resolution horizontal units, so
 	// either source must be expanded to the 768-pixel MCD212 backdrop space.
-	int dest_x = m_dvc_fmv_x_display ? (int(m_dvc_fmv_x_display) * 2) : (int(m_dvc_fmv_x_offset) * 2);
-	int dest_y = m_dvc_fmv_y_display ? int(m_dvc_fmv_y_display) : int(m_dvc_fmv_y_offset);
+	int dest_x = frame_x_display ? (int(frame_x_display) * 2) : (int(frame_x_offset) * 2);
+	int dest_y = frame_y_display ? int(frame_y_display) : int(frame_y_offset);
 
 	// Some titles program a full active FMV area but still leave Xd at zero and
 	// an Xo/Yo pair that would place the scaled window partly off-screen if
 	// interpreted literally. When that happens, treat the active dimensions as
 	// the intended display size and clamp the picture back onto the external
 	// video plane instead of cropping off the right/bottom edges.
-	if (!m_dvc_fmv_x_display && !m_dvc_fmv_y_display)
+	//
+	// Do not do this for explicit SHOW_NT movie windows.  CD-RTOS MV_WINDOW
+	// describes a rectangle inside the decoded picture, and MV_POS positions
+	// that window on the screen.  A 0/1-sized window is not a real crop, though:
+	// Burger King uses it with a full active field, and treating the raw decoded
+	// size as the EV stencil leaves the movie and transition mask too small.
+	const bool explicit_shownt_window = (frame_show_mode == DVC_SHOW_NT)
+		&& (frame_window_width > 1 || frame_window_height > 1);
+	if (!frame_x_display && !frame_y_display && !explicit_shownt_window)
 	{
-		const int active_draw_w = std::max(0, int(m_dvc_fmv_x_active) * 2);
-		const int active_draw_h = std::max(0, int(m_dvc_fmv_y_active));
+		const int active_draw_w = std::max(0, int(frame_x_active) * 2);
+		const int active_draw_h = std::max(0, int(frame_y_active));
 		if ((dest_x + draw_w) > bitmap.width() && active_draw_w > 0 && active_draw_w <= bitmap.width())
 		{
 			draw_w = active_draw_w;
@@ -2209,7 +2529,7 @@ void cdi_state::dvc_rebuild_external_video()
 			dest_y,
 			bitmap.width(),
 			bitmap.height());
-		dvc_apply_video_show_mode();
+		dvc_apply_video_show_mode(frame_visible, frame_show_mode);
 		m_mcd212->set_external_video_enable(false);
 		return;
 	}
@@ -2226,7 +2546,7 @@ void cdi_state::dvc_rebuild_external_video()
 		}
 	}
 
-	dvc_apply_video_show_mode();
+	dvc_apply_video_show_mode(frame_visible, frame_show_mode);
 	m_mcd212->set_external_video_enable(true);
 	dvc_log_video_state("rebuild ext video done", true);
 }
@@ -2241,14 +2561,14 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 	{
 		const uint32_t rom_offset = 0x40000 + ((address - DVC_VMPEG_ROM_BASE) & DVC_VMPEG_ROM_MASK);
 		const uint16_t data = (m_dvc_rom[rom_offset] << 8) | m_dvc_rom[rom_offset + 1];
-		LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+		LOGMASKED(LOG_DVC_IO, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
 		return data;
 	}
 
 	if ((address & 0xffff) >= 0x4800 && (address & 0xffff) <= 0x7ffe)
 	{
 		const uint16_t data = m_dvc_fmv_program_ram[((address & 0xffff) - 0x4800) >> 1];
-		LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+		LOGMASKED(LOG_DVC_IO, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
 		return data;
 	}
 
@@ -2296,43 +2616,61 @@ uint16_t cdi_state::dvc_r(offs_t offset, uint16_t mem_mask)
 		}
 		break;
 	case 0x4064: data = m_dvc_fmv_timer_compare; break;
-	case 0x406c: data = m_dvc_fmv_y_offset; break;
-	case 0x406e: data = m_dvc_fmv_x_offset; break;
-	case 0x4070: data = m_dvc_fmv_y_active; break;
-	case 0x4072: data = m_dvc_fmv_x_active; break;
-	case 0x4074: data = m_dvc_fmv_y_display; break;
-	case 0x4076: data = m_dvc_fmv_x_display; break;
-	case 0x4078: data = m_dvc_fmv_window_height; break;
-	case 0x407a: data = m_dvc_fmv_window_width; break;
-	case 0x407c: data = m_dvc_fmv_decoder_offset_y; break;
-	case 0x407e: data = m_dvc_fmv_decoder_offset_x; break;
+	case 0x406c: data = dvc_fmv_y_offset(); break;
+	case 0x406e: data = dvc_fmv_x_offset(); break;
+	case 0x4070: data = dvc_fmv_y_active(); break;
+	case 0x4072: data = dvc_fmv_x_active(); break;
+	case 0x4074: data = dvc_fmv_y_display(); break;
+	case 0x4076: data = dvc_fmv_x_display(); break;
+	case 0x4078: data = dvc_fmv_window_height(); break;
+	case 0x407a: data = dvc_fmv_window_width(); break;
+	case 0x407c: data = dvc_fmv_decoder_offset_y(); break;
+	case 0x407e: data = dvc_fmv_decoder_offset_x(); break;
 	case 0x4088:
 		data = m_dvc_fmv_decoder_command;
 		if (m_dvc_decoder_enabled)
 			data |= 0x0042;
+		LOGMASKED(LOG_DVC, "%s: DVC transport read decoder=%04x play=%d decoder_enabled=%d\n",
+			machine().describe_context(), data, m_dvc_playback_active ? 1 : 0, m_dvc_decoder_enabled ? 1 : 0);
 		break;
 	case 0x408c: data = m_dvc_fmv_video_data_input_command; break;
 	case 0x40da: data = m_dvc_fmv_program; break;
 	case 0x4098: data = current_dclk >> 6; break;
-	case 0x409c: data = 0; break;
-	case 0x409e: data = 0xfe96; break;
+	case 0x409c:
+		data = 0;
+		LOGMASKED(LOG_DVC, "%s: DVC transport read status-409c=%04x play=%d decoder_enabled=%d\n",
+			machine().describe_context(), data, m_dvc_playback_active ? 1 : 0, m_dvc_decoder_enabled ? 1 : 0);
+		break;
+	case 0x409e:
+		data = 0xfe96;
+		LOGMASKED(LOG_DVC, "%s: DVC transport read status-409e=%04x play=%d decoder_enabled=%d\n",
+			machine().describe_context(), data, m_dvc_playback_active ? 1 : 0, m_dvc_decoder_enabled ? 1 : 0);
+		break;
 	case 0x40a0: data = m_dvc_fmv_last_decoded_timestamp; break;
 	case 0x40a4: data = uint16_t(std::min<size_t>(31, m_dvc_video_queue.size())); break;
 	case 0x40a8: data = dvc_frame_period_90khz(m_dvc_frame_rate_hz); break;
 	case 0x40aa: data = dvc_frame_period_90khz(m_dvc_frame_rate_hz); break;
 	case 0x40ac: data = m_dvc_fmv_frame_rate; break;
-	case 0x40c0: data = m_dvc_fmv_system_command; break;
-	case 0x40c2: data = m_dvc_fmv_video_command; break;
+	case 0x40c0:
+		data = m_dvc_fmv_system_command;
+		LOGMASKED(LOG_DVC, "%s: DVC transport read system-command=%04x play=%d decoder_enabled=%d\n",
+			machine().describe_context(), data, m_dvc_playback_active ? 1 : 0, m_dvc_decoder_enabled ? 1 : 0);
+		break;
+	case 0x40c2:
+		data = m_dvc_fmv_video_command;
+		LOGMASKED(LOG_DVC, "%s: DVC transport read video-command=%04x play=%d decoder_enabled=%d\n",
+			machine().describe_context(), data, m_dvc_playback_active ? 1 : 0, m_dvc_decoder_enabled ? 1 : 0);
+		break;
 	case 0x40c4: data = m_dvc_fmv_stream & 0x000f; break;
 	case 0x40c6: data = m_dvc_fmv_system_control; break;
 	case 0x40dc: data = m_dvc_fmv_interrupt_vector; break;
 	case 0x40e6: data = 0; break;
 	default:
-		LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = 0000 & %04x\n", machine().describe_context(), address, mem_mask);
+		LOGMASKED(LOG_DVC_IO, "%s: dvc_r: %08x = 0000 & %04x\n", machine().describe_context(), address, mem_mask);
 		return 0;
 	}
 
-	LOGMASKED(LOG_DVC, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+	LOGMASKED(LOG_DVC_IO, "%s: dvc_r: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
 	return data;
 }
 
@@ -2340,7 +2678,7 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	const uint32_t address = 0xe00000 + (offset << 1);
 
-	LOGMASKED(LOG_DVC, "%s: dvc_w: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
+	LOGMASKED(LOG_DVC_IO, "%s: dvc_w: %08x = %04x & %04x\n", machine().describe_context(), address, data, mem_mask);
 
 	if (!m_dvc_mpeg_ram_enabled && m_dvc_mpeg_ram_enable_count < 0x40)
 	{
@@ -2402,21 +2740,34 @@ void cdi_state::dvc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	case 0x40ae:
 		dvc_update_irq_timer();
 		break;
-	case 0x406c: COMBINE_DATA(&m_dvc_fmv_y_offset); break;
-	case 0x406e: COMBINE_DATA(&m_dvc_fmv_x_offset); break;
-	case 0x4070: COMBINE_DATA(&m_dvc_fmv_y_active); break;
-	case 0x4072: COMBINE_DATA(&m_dvc_fmv_x_active); break;
-	case 0x4074: COMBINE_DATA(&m_dvc_fmv_y_display); break;
-	case 0x4076: COMBINE_DATA(&m_dvc_fmv_x_display); break;
-	case 0x4078: COMBINE_DATA(&m_dvc_fmv_window_height); break;
-	case 0x407a: COMBINE_DATA(&m_dvc_fmv_window_width); break;
-	case 0x407c: COMBINE_DATA(&m_dvc_fmv_decoder_offset_y); break;
-	case 0x407e: COMBINE_DATA(&m_dvc_fmv_decoder_offset_x); break;
+	case 0x406c: COMBINE_DATA(&dvc_fmv_y_offset()); break;
+	case 0x406e: COMBINE_DATA(&dvc_fmv_x_offset()); break;
+	case 0x4070: COMBINE_DATA(&dvc_fmv_y_active()); break;
+	case 0x4072: COMBINE_DATA(&dvc_fmv_x_active()); break;
+	case 0x4074: COMBINE_DATA(&dvc_fmv_y_display()); break;
+	case 0x4076: COMBINE_DATA(&dvc_fmv_x_display()); break;
+	case 0x4078: COMBINE_DATA(&dvc_fmv_window_height()); break;
+	case 0x407a: COMBINE_DATA(&dvc_fmv_window_width()); break;
+	case 0x407c: COMBINE_DATA(&dvc_fmv_decoder_offset_y()); break;
+	case 0x407e: COMBINE_DATA(&dvc_fmv_decoder_offset_x()); break;
 	case 0x4088: COMBINE_DATA(&m_dvc_fmv_decoder_command); break;
 	case 0x408c: COMBINE_DATA(&m_dvc_fmv_video_data_input_command); break;
 	case 0x40da:
 		COMBINE_DATA(&m_dvc_fmv_program);
-		LOGMASKED(LOG_DVC, "%s: DVC FMV program select %04x\n", machine().describe_context(), m_dvc_fmv_program);
+		LOGMASKED(LOG_DVC,
+			"%s: DVC FMV descriptor select %04x slot=%u active_program=%04x page=%u stored_vis=%u pending=%u mode=%u pos=(%u,%u) active=%ux%u win=%ux%u dec_off=(%u,%u)\n",
+			machine().describe_context(),
+			m_dvc_fmv_program,
+			unsigned(dvc_fmv_program_index()),
+			m_dvc_fmv_active_program,
+			unsigned(dvc_fmv_show_page()),
+			unsigned(m_dvc_fmv_visible[dvc_fmv_program_index()]),
+			unsigned(m_dvc_fmv_show_pending_state[dvc_fmv_program_index()]),
+			unsigned(m_dvc_fmv_show_mode_state[dvc_fmv_program_index()]),
+			unsigned(dvc_fmv_x_display()), unsigned(dvc_fmv_y_display()),
+			unsigned(dvc_fmv_x_active()), unsigned(dvc_fmv_y_active()),
+			unsigned(dvc_fmv_window_width()), unsigned(dvc_fmv_window_height()),
+			unsigned(dvc_fmv_decoder_offset_x()), unsigned(dvc_fmv_decoder_offset_y()));
 		break;
 	case 0x40ac: COMBINE_DATA(&m_dvc_fmv_frame_rate); break;
 	case 0x40c0:

@@ -33,6 +33,7 @@ public:
 		, m_maincpu(*this, "maincpu")
 		, m_main_rom(*this, "maincpu")
 		, m_dvc_rom(*this, "mpegs")
+		, m_screen(*this, "screen")
 		, m_lcd(*this, "lcd")
 		, m_slave_hle(*this, "slave_hle")
 		, m_plane_ram(*this, "plane%u", 0U)
@@ -55,6 +56,20 @@ protected:
 	{
 		uint16_t width = 0;
 		uint16_t height = 0;
+		uint16_t program = 0;
+		uint16_t y_offset = 0;
+		uint16_t x_offset = 0;
+		uint16_t y_active = 0;
+		uint16_t x_active = 0;
+		uint16_t y_display = 0;
+		uint16_t x_display = 0;
+		uint16_t window_height = 0;
+		uint16_t window_width = 0;
+		uint16_t decoder_offset_y = 0;
+		uint16_t decoder_offset_x = 0;
+		uint8_t show_page = 0;
+		uint8_t show_mode = 0;
+		uint8_t visible = 0;
 		std::vector<uint32_t> pixels;
 	};
 
@@ -113,6 +128,7 @@ protected:
 	required_device<scc68070_device> m_maincpu;
 	required_region_ptr<uint16_t> m_main_rom;
 	optional_region_ptr<uint8_t> m_dvc_rom;
+	required_device<screen_device> m_screen;
 	optional_device<screen_device> m_lcd;
 	optional_device<cdislave_hle_device> m_slave_hle;
 	required_shared_ptr_array<uint16_t, 2> m_plane_ram;
@@ -151,6 +167,7 @@ protected:
 
 	TIMER_CALLBACK_MEMBER(dvc_timer_tick);
 	TIMER_CALLBACK_MEMBER(dvc_video_tick);
+	TIMER_CALLBACK_MEMBER(dvc_picture_tick);
 	TIMER_CALLBACK_MEMBER(dvc_audio_tick);
 
 	uint8_t cdimono1_iack4_r();
@@ -166,6 +183,9 @@ protected:
 	void dvc_update_audio_timer();
 	void dvc_log_video_state(const char *reason, bool force = false);
 	void dvc_apply_video_show_mode();
+	void dvc_apply_video_show_mode(bool visible, uint8_t mode);
+	void dvc_commit_active_video_map(uint16_t program);
+	void dvc_update_video_show_pending();
 	void dvc_raise_fmv_irq(uint16_t bits);
 	void dvc_raise_fma_irq(uint16_t bits);
 	void dvc_handle_fmv_command(uint16_t data);
@@ -179,8 +199,33 @@ protected:
 	void dvc_decode_audio();
 	void dvc_update_audio_dac_fill();
 	void dvc_flush_audio_output(size_t max_samples = 0);
+	void dvc_latch_frame_descriptor(dvc_video_frame &frame);
 	void dvc_present_next_frame();
 	void dvc_rebuild_external_video();
+	static constexpr size_t DVC_FMV_PROGRAM_SLOTS = 16;
+	size_t dvc_fmv_program_index() const { return std::min<size_t>(m_dvc_fmv_program, DVC_FMV_PROGRAM_SLOTS - 1); }
+	uint16_t &dvc_fmv_y_offset() { return m_dvc_fmv_y_offset[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_x_offset() { return m_dvc_fmv_x_offset[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_y_active() { return m_dvc_fmv_y_active[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_x_active() { return m_dvc_fmv_x_active[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_y_display() { return m_dvc_fmv_y_display[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_x_display() { return m_dvc_fmv_x_display[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_window_height() { return m_dvc_fmv_window_height[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_window_width() { return m_dvc_fmv_window_width[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_decoder_offset_y() { return m_dvc_fmv_decoder_offset_y[dvc_fmv_program_index()]; }
+	uint16_t &dvc_fmv_decoder_offset_x() { return m_dvc_fmv_decoder_offset_x[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_y_offset() const { return m_dvc_fmv_y_offset[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_x_offset() const { return m_dvc_fmv_x_offset[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_y_active() const { return m_dvc_fmv_y_active[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_x_active() const { return m_dvc_fmv_x_active[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_y_display() const { return m_dvc_fmv_y_display[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_x_display() const { return m_dvc_fmv_x_display[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_window_height() const { return m_dvc_fmv_window_height[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_window_width() const { return m_dvc_fmv_window_width[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_decoder_offset_y() const { return m_dvc_fmv_decoder_offset_y[dvc_fmv_program_index()]; }
+	const uint16_t &dvc_fmv_decoder_offset_x() const { return m_dvc_fmv_decoder_offset_x[dvc_fmv_program_index()]; }
+	uint8_t &dvc_fmv_show_page() { return m_dvc_fmv_show_page[dvc_fmv_program_index()]; }
+	const uint8_t &dvc_fmv_show_page() const { return m_dvc_fmv_show_page[dvc_fmv_program_index()]; }
 
 	dvc_demux_state m_dvc_video_demux_state;
 	plm_video_t *m_dvc_video_plm = nullptr;
@@ -198,6 +243,7 @@ protected:
 
 	emu_timer *m_dvc_timer = nullptr;
 	emu_timer *m_dvc_video_timer = nullptr;
+	emu_timer *m_dvc_picture_timer = nullptr;
 	emu_timer *m_dvc_audio_timer = nullptr;
 
 	uint16_t m_dvc_fma_command = 0;
@@ -221,17 +267,22 @@ protected:
 	uint16_t m_dvc_fmv_decoder_command = 0;
 	uint16_t m_dvc_fmv_video_data_input_command = 0;
 	uint16_t m_dvc_fmv_stream = 0;
-	uint16_t m_dvc_fmv_y_offset = 0;
-	uint16_t m_dvc_fmv_x_offset = 0;
-	uint16_t m_dvc_fmv_y_active = 0;
-	uint16_t m_dvc_fmv_x_active = 0;
-	uint16_t m_dvc_fmv_y_display = 0;
-	uint16_t m_dvc_fmv_x_display = 0;
-	uint16_t m_dvc_fmv_window_height = 0;
-	uint16_t m_dvc_fmv_window_width = 0;
-	uint16_t m_dvc_fmv_decoder_offset_y = 0;
-	uint16_t m_dvc_fmv_decoder_offset_x = 0;
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_y_offset{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_x_offset{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_y_active{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_x_active{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_y_display{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_x_display{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_window_height{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_window_width{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_decoder_offset_y{};
+	std::array<uint16_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_decoder_offset_x{};
+	std::array<uint8_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_show_mode_state{};
+	std::array<uint8_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_show_page{};
+	std::array<uint8_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_visible{};
+	std::array<uint8_t, DVC_FMV_PROGRAM_SLOTS> m_dvc_fmv_show_pending_state{};
 	uint16_t m_dvc_fmv_program = 0;
+	uint16_t m_dvc_fmv_active_program = 0;
 	uint16_t m_dvc_fmv_demux_timestamp = 0;
 	uint16_t m_dvc_fmv_last_decoded_timestamp = 0;
 	uint16_t m_dvc_image_width = 0;
@@ -247,8 +298,17 @@ protected:
 		DVC_SHOW_NT = 2
 	};
 
+	enum dvc_video_visibility_pending : uint8_t
+	{
+		DVC_VISIBILITY_STABLE = 0,
+		DVC_VISIBILITY_SHOW_NEXT_PICTURE = 1
+	};
+
 	bool m_dvc_decoder_enabled = false;
 	bool m_dvc_playback_active = false;
+	bool m_dvc_playback_paused = false;
+	bool m_dvc_pause_pending = false;
+	bool m_dvc_video_presentation_started = false;
 	bool m_dvc_video_visible = false;
 	bool m_dvc_video_show_pending = false;
 	uint8_t m_dvc_video_show_mode = DVC_SHOW_HIDDEN;
@@ -260,6 +320,8 @@ protected:
 	bool m_dvc_audio_last_decoded_valid = false;
 	bool m_dvc_fmv_register_update_latch = false;
 	bool m_dvc_fmv_register_update_scroll = false;
+	bool m_dvc_picture_eod_pending = false;
+	uint16_t m_dvc_picture_irq_pending = 0;
 	bool m_dvc_mpeg_ram_enabled = false;
 	bool m_cdic_irq_pending = false;
 	int16_t m_dvc_audio_output_level[2] = { 0, 0 };

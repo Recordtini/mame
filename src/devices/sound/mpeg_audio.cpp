@@ -62,12 +62,16 @@ bool mpeg_audio::decode_buffer(int &pos, int limit, short *output,
 		double saved_amp_values[2][3][32];
 		double saved_bdata[2][3][32];
 		double saved_subbuffer[2][32];
+		double saved_audio_buffer[2][32*32];
+		int saved_audio_buffer_pos[2];
 		std::memcpy(saved_band_param, band_param, sizeof(saved_band_param));
 		std::memcpy(saved_scfsi, scfsi, sizeof(saved_scfsi));
 		std::memcpy(saved_scf, scf, sizeof(saved_scf));
 		std::memcpy(saved_amp_values, amp_values, sizeof(saved_amp_values));
 		std::memcpy(saved_bdata, bdata, sizeof(saved_bdata));
 		std::memcpy(saved_subbuffer, subbuffer, sizeof(saved_subbuffer));
+		std::memcpy(saved_audio_buffer, audio_buffer, sizeof(saved_audio_buffer));
+		std::memcpy(saved_audio_buffer_pos, audio_buffer_pos, sizeof(saved_audio_buffer_pos));
 		current_pos = search_pos;
 		current_limit = limit;
 		cbr_param_index = atbl;
@@ -120,6 +124,14 @@ bool mpeg_audio::decode_buffer(int &pos, int limit, short *output,
 				abort();
 			case 2:
 				read_header_mpeg2(variant == 2);
+				// Validate the container before synthesis changes the history used
+				// by the next frame. DMA may split a frame at any byte, including
+				// its ancillary tail after all audio samples have been decoded.
+				if (frame_start + frame_bytes * 8 > limit)
+					throw limit_hit();
+				if (!next_header_plausible(frame_start + frame_bytes * 8, limit))
+					throw invalid_header();
+				current_limit = frame_start + frame_bytes * 8;
 				read_data_mpeg2();
 				decode_mpeg2(output, output_samples);
 				break;
@@ -149,8 +161,13 @@ bool mpeg_audio::decode_buffer(int &pos, int limit, short *output,
 			std::memcpy(amp_values, saved_amp_values, sizeof(saved_amp_values));
 			std::memcpy(bdata, saved_bdata, sizeof(saved_bdata));
 			std::memcpy(subbuffer, saved_subbuffer, sizeof(saved_subbuffer));
+			std::memcpy(audio_buffer, saved_audio_buffer, sizeof(saved_audio_buffer));
+			std::memcpy(audio_buffer_pos, saved_audio_buffer_pos, sizeof(saved_audio_buffer_pos));
+			output_samples = 0;
 			return false;
 		} catch(invalid_header) {
+			std::memcpy(audio_buffer, saved_audio_buffer, sizeof(saved_audio_buffer));
+			std::memcpy(audio_buffer_pos, saved_audio_buffer_pos, sizeof(saved_audio_buffer_pos));
 			search_pos += search_step;
 			continue;
 		}
@@ -162,13 +179,6 @@ bool mpeg_audio::decode_buffer(int &pos, int limit, short *output,
 		if (frame_bytes > 0)
 		{
 			const int frame_limit = frame_start + frame_bytes * 8;
-			if (frame_limit > limit)
-				return false;
-			if (!next_header_plausible(frame_limit, limit))
-			{
-				search_pos += search_step;
-				continue;
-			}
 			current_pos = frame_limit;
 		}
 

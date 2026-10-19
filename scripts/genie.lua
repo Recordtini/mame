@@ -1075,6 +1075,11 @@ end
 					"-Wno-xor-used-as-pow",
 				}
 			end
+			if version >= 160000 then
+				buildoptions_cpp {
+					"-Wno-error=sfinae-incomplete", -- device_t is forward-declared when delegate type traits are instantiated
+				}
+			end
 		end
 	end
 

@@ -23,6 +23,9 @@ permissions:
 
 jobs:
   build-windows:
+    env:
+      SUBTARGET: mamecdi
+      SOURCES: src/mame/philips/cdi.cpp
     strategy:
       matrix:
         compiler: [gcc-x64, clang-x64, clang-arm64]
@@ -33,16 +36,12 @@ jobs:
             slug: mingw-w64-x86_64
             cc: gcc
             cxx: g++
-            subtarget: mame
-            executable: mame
           - compiler: clang-x64
             os: windows-latest
             msys: MINGW64
             slug: mingw-w64-x86_64
             cc: clang
             cxx: clang++
-            subtarget: tiny
-            executable: mametiny
           - compiler: clang-arm64
             os: windows-11-arm
             msys: CLANGARM64
@@ -50,8 +49,6 @@ jobs:
             extrapkg: mingw-w64-clang-aarch64-gcc-compat
             cc: clang
             cxx: clang++
-            subtarget: mame
-            executable: mame
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -70,16 +67,15 @@ jobs:
         OVERRIDE_CC: ${{ matrix.cc }}
         OVERRIDE_CXX: ${{ matrix.cxx }}
         ARCHOPTS: "-fuse-ld=lld"
-        SUBTARGET: ${{ matrix.subtarget }}
         TOOLS: 1
       run: make -j3
     - name: Validate
-      run: ./${{ matrix.executable }}.exe -validate
+      run: ./mamecdi.exe -validate
     - uses: actions/upload-artifact@main
       with:
-        name: ${{ matrix.executable }}-windows-${{ matrix.compiler }}-${{ github.sha }}
+        name: mamecdi-windows-${{ matrix.compiler }}-${{ github.sha }}
         path: |
-          ${{ matrix.executable }}.exe
+          mamecdi.exe
           chdman.exe
           unidasm.exe
         if-no-files-found: error
